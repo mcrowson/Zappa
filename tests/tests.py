@@ -761,7 +761,8 @@ USE_TZ = True
 
         app = get_django_wsgi('dj_test_settings')
         os.remove('dj_test_settings.py')
-        os.remove('dj_test_settings.pyc')
+        if os.path.isfile('dj_test_settings.pyc'):
+            os.remove('dj_test_settings.pyc')
 
     ##
     # Util / Misc
