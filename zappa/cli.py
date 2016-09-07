@@ -34,6 +34,7 @@ from dateutil import parser
 from datetime import datetime,timedelta
 from zappa import Zappa, logger
 from util import detect_django_settings, detect_flask_apps
+from collections import OrderedDict
 
 CUSTOM_SETTINGS = [
     'assume_policy',
@@ -109,8 +110,8 @@ class ZappaCLI(object):
         """A shortcut property for settings of staging."""
         # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
         settings = self.zappa_settings[self.api_stage]
-        if 'delete_zip' in settings:
-            settings['delete_local_zip'] = settings['delete_zip']
+        if u'delete_zip' in settings:
+            settings[u'delete_local_zip'] = settings.get(u'delete_zip')
         return settings
 
     def handle(self, argv=None):
