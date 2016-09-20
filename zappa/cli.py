@@ -34,12 +34,14 @@ from dateutil import parser
 from datetime import datetime,timedelta
 from zappa import Zappa, logger
 from util import detect_django_settings, detect_flask_apps
+from collections import OrderedDict
 
 CUSTOM_SETTINGS = [
     'assume_policy',
     'attach_policy',
     'aws_region',
-    'delete_zip',
+    'delete_local_zip',
+    'delete_s3_zip',
     'exclude',
     'http_methods',
     'integration_response_codes',
@@ -106,7 +108,11 @@ class ZappaCLI(object):
     @property
     def stage_config(self):
         """A shortcut property for settings of staging."""
-        return self.zappa_settings[self.api_stage]
+        # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
+        settings = self.zappa_settings[self.api_stage]
+        if u'delete_zip' in settings:
+            settings[u'delete_local_zip'] = settings.get(u'delete_zip')
+        return settings
 
     def handle(self, argv=None):
         """
@@ -297,11 +303,12 @@ class ZappaCLI(object):
                 requests.get(endpoint_url)
 
         # Finally, delete the local copy our zip package
-        if self.stage_config.get('delete_zip', True):
+        if self.stage_config.get('delete_local_zip', True):
             os.remove(self.zip_path)
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
         self.callback('post')
 
@@ -363,7 +370,7 @@ class ZappaCLI(object):
                                                        memory_size=self.memory_size)
 
         # Finally, delete the local copy our zip package
-        if self.stage_config.get('delete_zip', True):
+        if self.stage_config.get('delete_local_zip', True):
             os.remove(self.zip_path)
 
         if self.stage_config.get('domain', None):
@@ -1111,7 +1118,7 @@ class ZappaCLI(object):
         Remove our local zip file.
         """
 
-        if self.stage_config.get('delete_zip', True):
+        if self.stage_config.get('delete_local_zip', True):
             try:
                 os.remove(self.zip_path)
             except Exception as e: # pragma: no cover

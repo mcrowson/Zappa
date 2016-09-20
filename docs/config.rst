@@ -20,7 +20,8 @@ Envirnments, such as *dev*, *staging*, and *production* are configured in the *z
                 "post": "my_app.post_callback", // After command has excuted
             },
             "debug": true
-            "delete_zip": true
+            "delete_local_zip": true // Delete the local zip file sent to S3
+            "delete_s3_zip": true // Delete the s3 zip file sent to Lambda
             "domain": "yourapp.yourdomain.com",
            "events": [
                 {   // Recurring events
@@ -114,10 +115,15 @@ debug
 
 This boolean setting governs whether Zappa configuration errors tracebacks are to appear in HTTP 500 error pages.
 
-delete_zip
+delete_local_zip
 ==========
 
-This boolean setting specifies wheter to delete the local zip archive after code updates.
+This boolean setting specifies whether to delete the local zip archive after code updates.
+
+delete_s3_zip
+==========
+
+This boolean setting specifies whether to delete the s3 zip archive after code updates.
 
 domain
 ======
