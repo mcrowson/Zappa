@@ -33,8 +33,7 @@ import zipfile
 from dateutil import parser
 from datetime import datetime,timedelta
 from zappa import Zappa, logger
-from util import detect_django_settings, detect_flask_apps
-from collections import OrderedDict
+from util import check_new_version_available, detect_django_settings, detect_flask_apps
 
 CUSTOM_SETTINGS = [
     'assume_policy',
@@ -157,10 +156,14 @@ class ZappaCLI(object):
             print("The command '{}' is not recognized. {}".format(command, help_message))
             return
 
+        # Settings-based interactions will fail
+        # before a project has been initialized.
         if command != 'init':
-            if len(command_env) < 2: # pragma: no cover
-                self.load_settings_file(vargs['settings_file'])
 
+             # Load and Validate Settings File
+            self.load_settings_file(vargs['settings_file'])
+
+            if len(command_env) < 2: # pragma: no cover
                 # If there's only one environment defined in the settings,
                 # use that as the default.
                 if len(self.zappa_settings.keys()) is 1:
@@ -171,12 +174,12 @@ class ZappaCLI(object):
             else:
                 self.api_stage = command_env[1]
 
+            if vargs['app_function'] is not None:
+                self.app_function = vargs['app_function']
+
             # Load our settings
             self.load_settings(vargs['settings_file'])
             self.callback('settings')
-
-            if vargs['app_function'] is not None:
-                self.app_function = vargs['app_function']
 
         # Hand it off
         if command == 'deploy': # pragma: no cover
@@ -244,9 +247,18 @@ class ZappaCLI(object):
             click.echo("This application is " + click.style("already deployed", fg="red") + " - did you mean to call " + click.style("update", bold=True) + "?")
             return
 
+        # Make sure there isn't a new version available
+        self.check_for_update()
+
         # Make sure the necessary IAM execution roles are available
         if self.manage_roles:
-            self.zappa.create_iam_roles()
+            try:
+                self.zappa.create_iam_roles()
+            except botocore.client.ClientError:
+                click.echo(click.style("Failed", fg="red") + " to " + click.style("manage IAM roles", bold=True) + "!")
+                click.echo("You may " + click.style("lack the necessary AWS permissions", bold=True) + " to automatically manage a Zappa execution role.")
+                click.echo("To fix this, see here: " + click.style("https://github.com/Miserlou/Zappa#using-custom-aws-iam-roles-and-policie", bold=True))
+                return
 
         # Create the Lambda Zip
         self.create_package()
@@ -275,9 +287,22 @@ class ZappaCLI(object):
 
         endpoint_url = ''
         if self.use_apigateway:
+
+            if self.iam_authorization:
+                auth_type = "AWS_IAM"
+            else:
+                auth_type = "NONE"
+
             # Create and configure the API Gateway
-            api_id = self.zappa.create_api_gateway_routes(
-                self.lambda_arn, self.lambda_name, self.api_key_required, self.integration_content_type_aliases)
+
+            template = self.zappa.create_stack_template(self.lambda_arn,
+                                                        self.lambda_name,
+                                                        self.api_key_required,
+                                                        self.integration_content_type_aliases,
+                                                        auth_type)
+
+            self.zappa.update_stack(self.lambda_name, self.s3_bucket_name, wait=True)
+            api_id = self.zappa.get_api_id(self.lambda_name)
 
             # Deploy the API!
             cache_cluster_enabled = self.stage_config.get('cache_cluster_enabled', False)
@@ -304,7 +329,7 @@ class ZappaCLI(object):
 
         # Finally, delete the local copy our zip package
         if self.stage_config.get('delete_local_zip', True):
-            os.remove(self.zip_path)
+            self.remove_local_zip()
 
         # Remove the uploaded zip from S3, because it is now registered..
         if self.stage_config.get('delete_s3_zip', True):
@@ -324,6 +349,9 @@ class ZappaCLI(object):
         if self.prebuild_script:
             self.execute_prebuild_script()
 
+        # Make sure there isn't a new version available
+        self.check_for_update()
+
         # Temporary version check
         try:
             updated_time = 1472581018
@@ -340,7 +368,13 @@ class ZappaCLI(object):
 
         # Make sure the necessary IAM execution roles are available
         if self.manage_roles:
-            self.zappa.create_iam_roles()
+            try:
+                self.zappa.create_iam_roles()
+            except botocore.client.ClientError:
+                click.echo(click.style("Failed", fg="red") + " to " + click.style("manage IAM roles", bold=True) + "!")
+                click.echo("You may " + click.style("lack the necessary AWS permissions", bold=True) + " to automatically manage a Zappa execution role.")
+                click.echo("To fix this, see here: " + click.style("https://github.com/Miserlou/Zappa#using-custom-aws-iam-roles-and-policie", bold=True))
+                return
 
         # Create the Lambda Zip,
         self.create_package()
@@ -358,7 +392,8 @@ class ZappaCLI(object):
             self.s3_bucket_name, self.zip_path, self.lambda_name)
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
         # Update the configuration, in case there are changes.
         self.lambda_arn = self.zappa.update_lambda_configuration(lambda_arn=self.lambda_arn,
@@ -371,7 +406,19 @@ class ZappaCLI(object):
 
         # Finally, delete the local copy our zip package
         if self.stage_config.get('delete_local_zip', True):
-            os.remove(self.zip_path)
+            self.remove_local_zip()
+
+        if self.iam_authorization:
+            auth_type = "AWS_IAM"
+        else:
+            auth_type = "NONE"
+
+        template = self.zappa.create_stack_template(self.lambda_arn,
+                                                    self.lambda_name,
+                                                    self.api_key_required,
+                                                    self.integration_content_type_aliases,
+                                                    auth_type)
+        self.zappa.update_stack(self.lambda_name, self.s3_bucket_name, wait=True, update_only=True)
 
         if self.stage_config.get('domain', None):
             endpoint_url = self.stage_config.get('domain')
@@ -392,7 +439,25 @@ class ZappaCLI(object):
 
         if endpoint_url and 'https://' not in endpoint_url:
             endpoint_url = 'https://' + endpoint_url
-        click.echo("Your updated Zappa deployment is " + click.style("live", fg='green', bold=True) + "!: {}".format(endpoint_url))
+
+        deployed_string = "Your updated Zappa deployment is " + click.style("live", fg='green', bold=True) + "!: " + click.style("{}".format(endpoint_url), bold=True)
+        
+        api_url = None
+        if endpoint_url and 'amazonaws.com' not in endpoint_url:
+            api_url = self.zappa.get_api_url(
+                self.lambda_name,
+                self.api_stage)
+
+            if endpoint_url != api_url:
+                deployed_string = deployed_string + " (" + api_url + ")"
+
+        if self.stage_config.get('touch', True):
+            if api_url:
+                requests.get(api_url)
+            elif endpoint_url: 
+                requests.get(endpoint_url)
+
+        click.echo(deployed_string)
 
         return
 
@@ -611,7 +676,7 @@ class ZappaCLI(object):
         tabular_print("Lambda Timeout", conf['Timeout'])
         tabular_print("Lambda Runtime", conf['Runtime'])
         if 'VpcConfig' in conf.keys():
-            tabular_print("Lambda VPC ID", conf['VpcConfig']['VpcId'])
+            tabular_print("Lambda VPC ID", conf.get('VpcConfig', {}).get('VpcId', 'Not assigned'))
         else:
             tabular_print("Lambda VPC ID", None)
 
@@ -899,6 +964,21 @@ class ZappaCLI(object):
             module_ = importlib.import_module(mod_name)
             getattr(module_, cb_func)(self)  # Call the function passing self
 
+    def check_for_update(self):
+        """
+        Print a warning if there's a new Zappa version available.
+        """
+        try:
+            version = pkg_resources.require("zappa")[0].version
+            updateable = check_new_version_available(version)
+            if updateable:
+                click.echo(click.style("Important!", fg="yellow", bold=True) + " A new version of " + click.style("Zappa", bold=True) + " is available!")
+                click.echo("Upgrade with: " + click.style("pip install zappa --upgrade", bold=True))
+                click.echo("Visit the project page on GitHub to see the latest changes: " + click.style("https://github.com/Miserlou/Zappa", bold=True))
+        except Exception as e: # pragma: no cover
+            print(e)
+            return 
+
     def load_settings(self, settings_file="zappa_settings.json", session=None):
         """
         Load the local zappa_settings.json file.
@@ -975,10 +1055,10 @@ class ZappaCLI(object):
             self.api_stage].get('django_settings', None)
         self.manage_roles = self.zappa_settings[
             self.api_stage].get('manage_roles', True)
-        self.api_key_required = self.zappa_settings[
-            self.api_stage].get('api_key_required', False)
+        self.api_key_required = self.stage_config.get('api_key_required', False)
         self.api_key = self.zappa_settings[
             self.api_stage].get('api_key')
+        self.iam_authorization = self.stage_config.get('iam_authorization', False)
         self.lambda_description = self.zappa_settings[
             self.api_stage].get('lambda_description', "Zappa Deployment")
         self.environment_variables = self.zappa_settings[
@@ -1007,7 +1087,10 @@ class ZappaCLI(object):
         """
 
         with open(settings_file) as json_file:
-            self.zappa_settings = json.load(json_file)
+            try:
+                self.zappa_settings = json.load(json_file)
+            except ValueError:
+                raise ValueError("Unable to load the zappa settings JSON. It may be malformed.")
 
     def create_package(self):
         """
@@ -1130,10 +1213,8 @@ class ZappaCLI(object):
         """
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
-
-        # Finally, delete the local copy our zip package
-        self.remove_local_zip()
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
     def print_logs(self, logs):
         """
@@ -1197,18 +1278,21 @@ def handle(): # pragma: no cover
     except SystemExit as e: # pragma: no cover
         if cli.zip_path:
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
 
         sys.exit(e.code)
 
     except KeyboardInterrupt: # pragma: no cover
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
         sys.exit(130)
     except Exception as e:
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
 
-        click.echo("Oh no! An " + click.style("error occured", fg='red', bold=True) + "! :(")
+        click.echo("Oh no! An " + click.style("error occurred", fg='red', bold=True) + "! :(")
         click.echo("\n==============\n")
         import traceback
         traceback.print_exc()

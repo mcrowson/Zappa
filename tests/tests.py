@@ -25,6 +25,15 @@ def random_string(length):
 
 
 class TestZappa(unittest.TestCase):
+    def setUp(self):
+        self.sleep_patch = mock.patch('time.sleep', return_value=None)
+        if not os.environ.get('PLACEBO_MODE') == 'record':
+            self.sleep_patch.start()
+
+    def tearDown(self):
+        if not os.environ.get('PLACEBO_MODE') == 'record':
+            self.sleep_patch.stop()
+
     ##
     # Sanity Tests
     ##
@@ -159,23 +168,7 @@ class TestZappa(unittest.TestCase):
         z.http_methods = ['GET']
         z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
         lambda_arn = 'arn:aws:lambda:us-east-1:12345:function:helloworld'
-        with mock.patch('time.time', return_value=123.456):
-            api_id = z.create_api_gateway_routes(lambda_arn)
-        self.assertEqual(api_id, 'j27idab94h')
-
-    @placebo_session
-    def test_deploy_api_gateway(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
-
-        z.parameter_depth = 1
-        z.integration_response_codes = [200]
-        z.method_response_codes = [200]
-        z.http_methods = ['GET']
-
-        lambda_arn = 'arn:aws:lambda:us-east-1:12345:function:django-helloworld-unicode'
-        api_id = z.create_api_gateway_routes(lambda_arn)
-        endpoint_url = z.deploy_api_gateway(api_id, "test_stage")
+        z.create_api_gateway_routes(lambda_arn)
 
     @placebo_session
     def test_get_api_url(self, session):
@@ -536,6 +529,7 @@ class TestZappa(unittest.TestCase):
             }
         ]
         zappa_cli.print_logs(logs)
+        zappa_cli.check_for_update()
 
     def test_cli_args(self):
         zappa_cli = ZappaCLI()
@@ -543,11 +537,16 @@ class TestZappa(unittest.TestCase):
         argv = '-s test_settings.json derp ttt888'.split()
         zappa_cli.handle(argv)
 
+    def test_bad_json_catch(self):
+        zappa_cli = ZappaCLI()
+        self.assertRaises(ValueError, zappa_cli.load_settings_file('tests/test_bad_settings.json'))
+
     @placebo_session
     def test_cli_aws(self, session):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = 'ttt888'
         zappa_cli.api_key_required = True
+        zappa_cli.authorization_type = 'NONE'
         zappa_cli.load_settings('test_settings.json', session)
         zappa_cli.zappa.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
         zappa_cli.deploy()
@@ -558,14 +557,13 @@ class TestZappa(unittest.TestCase):
         zappa_cli.unschedule()
         zappa_cli.undeploy(noconfirm=True, remove_logs=True)
 
-
     @placebo_session
     def test_cli_aws_status(self, session):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = 'ttt888'
         zappa_cli.load_settings('test_settings.json', session)
         zappa_cli.api_stage = 'devor'
-        zappa_cli.lambda_name = 'baby-flask-devor'        
+        zappa_cli.lambda_name = 'baby-flask-devor'
         zappa_cli.zappa.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
         resp = zappa_cli.status()
 
@@ -574,6 +572,7 @@ class TestZappa(unittest.TestCase):
         if os.path.isfile('zappa_settings.json'):
             os.remove('zappa_settings.json')
 
+        # Test directly
         zappa_cli = ZappaCLI()
         # Via http://stackoverflow.com/questions/2617057/how-to-supply-stdin-files-and-environment-variable-inputs-to-python-unit-tests
         inputs = ['dev', 'lmbda', 'test_settings', '']
@@ -584,13 +583,15 @@ class TestZappa(unittest.TestCase):
         if os.path.isfile('zappa_settings.json'):
             os.remove('zappa_settings.json')
 
-        # with mock.patch('__builtin__.raw_input', lambda prompt: next(input_generator)):
-        #     zappa_cli = ZappaCLI()
-        #     argv = ['init']
-        #     zappa_cli.handle(argv)
+        # Test via handle()
+        input_generator = (i for i in inputs)
+        with mock.patch('__builtin__.raw_input', lambda prompt: next(input_generator)):
+            zappa_cli = ZappaCLI()
+            argv = ['init']
+            zappa_cli.handle(argv)
 
-        # if os.path.isfile('zappa_settings.json'):
-        #     os.remove('zappa_settings.json')
+        if os.path.isfile('zappa_settings.json'):
+            os.remove('zappa_settings.json')
 
     def test_domain_name_match(self):
         # Simple sanity check

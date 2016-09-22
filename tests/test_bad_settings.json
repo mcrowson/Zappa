@@ -1,14 +1,13 @@
 {
     "ttt888": {
-       "touch": false,
-       "s3_bucket": "lmbda",
+       "s3_bucket": "lmbda"
        "app_function": "tests.test_app.hello_world",
        "callbacks": {
            "settings": "test_settings.callback",
            "post": "test_settings.callback",
            "zip": "test_settings.callback"
        },
-       "delete_local_zip": true,
+       "delete_zip": true,
        "debug": true,
        "parameter_depth": 2, 
        "prebuild_script": "test_settings.prebuild_me",
@@ -36,7 +35,7 @@
            "post": "test_settings.callback",
            "zip": "test_settings.callback"
        },
-       "delete_local_zip": true,
+       "delete_zip": true,
        "debug": true,
        "parameter_depth": 2, 
        "prebuild_script": "test_settings.prebuild_me",

@@ -34,7 +34,8 @@
     - [Keeping The Server Warm](#keeping-the-server-warm)
     - [Serving Static Files / Binary Uploads](#serving-static-files--binary-uploads)
     - [Enabling CORS](#enabling-cors)
-    - [Enabling Secure Endpoints on API Gateway](#enabling-secure-endpoints-on-api-gateway)
+    - [Enabling Secure Endpoints on API Gateway (API Key)](#enabling-secure-endpoints-on-api-gateway-api-key)
+    - [Enabling Secure Endpoints on API Gateway (IAM Policy)](#enabling-secure-endpoints-on-api-gateway-iam-policy)
     - [Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-dns-auth)
     - [Deploying to a Domain With a Let's Encrypt Certificate (HTTP Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-http-auth)
     - [Setting Environment Variables](#setting-environment-variables)
@@ -50,6 +51,7 @@
 - [Hacks](#hacks)
 - [Contributing](#contributing)
     - [Using a Local Repo](#using-a-local-repo)
+- [Support / Development / Training / Consulting](#support--development--training--consulting)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -112,7 +114,7 @@ Next, you'll need to define your local and server-side settings.
 
     $ zappa init
 
-This will automatically detect your application type (Flask, Django, etc.) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
+This will automatically detect your application type (Flask/Django - Pyramid users [see here](https://github.com/Miserlou/Zappa/issues/278#issuecomment-241917956)) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
 
 ```javascript
 {
@@ -231,6 +233,22 @@ And then:
 
 And now your function will execute every time a new upload appears in your bucket!
 
+Similarly, for a [Simple Notification Service](https://aws.amazon.com/sns/) event:
+
+```javascript
+        "events": [
+            {
+                "function": "your_module.your_function",
+                "event_source": {
+                    "arn":  "arn:aws:sns:::your-event-topic-arn",
+                    "events": [
+                        "sns:Publish"
+                    ]
+                }
+            }
+        ]
+```
+
 #### Undeploy
 
 If you need to remove the API Gateway and Lambda function that you have previously published, you can simply:
@@ -313,7 +331,7 @@ to change Zappa's behavior. Use these at your own risk!
         "cloudwatch_metrics_enabled": false, // Additional metrics for the API Gateway.
         "debug": true, // Print Zappa configuration errors tracebacks in the 500
         "delete_local_zip": true, // Delete the local zip archive after code updates
-        "delete_s3_zip": true, // Delete the s3 zip archive after the code updates
+        "delete_s3_zip": true, // Delete the s3 zip archive
         "django_settings": "your_project.production_settings", // The modular path to your Django project's settings. For Django projects only.
         "domain": "yourapp.yourdomain.com", // Required if you're using a domain
         "environment_variables": {"your_key": "your_value"}, // A dictionary of environment variables that will be available to your deployed app. See also "remote_env_file". Default {}.
@@ -335,6 +353,7 @@ to change Zappa's behavior. Use these at your own risk!
         "exception_handler": "your_module.report_exception", // function that will be invoked in case Zappa sees an unhandled exception raised from your code
         "exclude": ["*.gz", "*.rar"], // A list of regex patterns to exclude from the archive
         "http_methods": ["GET", "POST"], // HTTP Methods to route,
+        "iam_authorization": true, // optional, use IAM to require request signing. Default false.
         "integration_response_codes": [200, 301, 404, 500], // Integration response status codes to route
         "integration_content_type_aliases": { // For routing requests with non-standard mime types
             "application/json": [
@@ -397,9 +416,15 @@ Similarly, you will not be able to accept binary multi-part uploads through the 
 
 To enable Cross-Origin Resource Sharing (CORS) for your application, follow the [AWS "How to CORS" Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html) to enable CORS via the API Gateway Console. Don't forget to enable CORS per parameter and re-deploy your API after making the changes!
 
-#### Enabling Secure Endpoints on API Gateway
+You can also simply handle CORS directly in your application. If you do this, you'll need to add `Access-Control-Allow-Origin`, `Access-Control-Allow-Headers`, and `Access-Control-Allow-Methods` to the `method_header_types` key in your `zappa_settings.json`. See further [discussion here](https://github.com/Miserlou/Zappa/issues/41).
+
+#### Enabling Secure Endpoints on API Gateway (API Key)
 
 You can use the `api_key_required` setting to generate and assign an API key to all the routes of your API Gateway. After redeployment, you can then pass the provided key as a header called `x-api-key` to access the restricted endpoints. Without the `x-api-key` header, you will receive a 403. [More information on API keys in the API Gateway](http://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-api-keys.html)
+
+#### Enabling Secure Endpoints on API Gateway (IAM Policy)
+
+You can enable IAM-based (v4 signing) authorization on an API by setting the `iam_authorization` setting to `true`. Your API will then require signed requests and access can be controlled via [IAM policy](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-iam-policy-examples.html). Unsigned requests will receive a 403 response, as will requesters who are not authorized to access the API.
 
 #### Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)
 
@@ -557,6 +582,8 @@ Ongoing discussion about the minimum policy requirements necessary for a Zappa d
 * [Zappa Slack Inviter](https://github.com/Miserlou/zappa-slack-inviter) - A tiny, server-less service for inviting new users to your Slack channel.
 * [Serverless Image Host](https://github.com/Miserlou/serverless-imagehost) - A thumbnailing service with Flask, Zappa and Pillow.
 * [Gigger](https://www.gigger.rocks/) - The live music industry's search engine
+* [Zappa BitTorrent Tracker](https://github.com/Miserlou/zappa-bittorrent-tracker) - An experimental server-less BitTorrent tracker. Work in progress.
+* [JankyGlance](https://github.com/Miserlou/JankyGlance) - A server-less Yahoo! Pipes replacement.
 * And many more!
 
 Are you using Zappa? Let us know and we'll list your site here!
@@ -567,6 +594,7 @@ Are you using Zappa? Let us know and we'll list your site here!
 * [zappa-cms](http://github.com/Miserlou/zappa-cms) - A tiny server-less CMS for busy hackers. Work in progress.
 * [flask-ask](https://github.com/johnwheeler/flask-ask) - A framework for building Amazon Alexa applications. Uses Zappa for deployments.
 * [zappa-file-widget](https://github.com/anush0247/zappa-file-widget) - A Django plugin for supporting binary file uploads in Django on Zappa.
+* [zops](https://github.com/bjinwright/zops) - Utilities for teams and continuous integrations using Zappa. 
 
 ## Hacks
 
@@ -590,3 +618,21 @@ Please also write comments along with your new code, including the URL of the ti
 #### Using a Local Repo
 
 To use the git HEAD, you *can't* use `pip install -e `. Instead, you should clone the repo to your machine and then `pip install /path/to/zappa/repo` or `ln -s /path/to/zappa/repo/zappa zappa` in your local project.
+
+## Support / Development / Training / Consulting
+
+Do you need help with..
+ 
+  * Porting existing Flask and Django applications to Zappa?
+  * Building new applications and services that scale infinitely?
+  * Reducing your operations and hosting costs?
+  * Adding new custom features into Zappa?
+  * Training your team to use AWS and other server-less paradigms?
+
+Good news! We're currently available for remote and on-site consulting for small, large and enterprise teams. Please contact <miserlou@gmail.com> with your needs and let's work together!
+
+<br />
+<p align="center">
+  <a href="https://gun.io"><img src="http://i.imgur.com/M7wJipR.png" alt="Made by Gun.io"/></a>
+</p>
+
