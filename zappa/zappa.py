@@ -317,13 +317,10 @@ class Zappa(object):
             for link in glob.glob(os.path.join(temp_package_path, "*.egg-link")):
                 os.remove(link)
 
-    def create_lambda_zip(self, prefix='lambda_package', handler_file=None,
-                          minify=True, exclude=None, use_precompiled_packages=True, include=None, venv=None):
+    def create_site_packages_zip(self, prefix='site_packages', use_precompiled_packages=True, venv=None, minify=True):
         """
-        Create a Lambda-ready zip file of the current virtualenvironment and working directory.
-
-        Returns path to that file.
-
+        Create a zip of the site-packages in the current virtualenvironment.
+        Returns path to that file
         """
         import pip
 
@@ -352,8 +349,7 @@ class Zappa(object):
         zip_path = os.path.join(cwd, zip_fname)
 
         # Files that should be excluded from the zip
-        if exclude is None:
-            exclude = list()
+        exclude = list()
 
         # Exclude the zip itself
         exclude.append(zip_path)
@@ -366,6 +362,7 @@ class Zappa(object):
                 (path, tail) = os.path.split(path)
             parts.append(os.path.join(path, tail))
             return map(os.path.normpath, parts)[::-1]
+
         split_venv = splitpath(venv)
         split_cwd = splitpath(cwd)
 
@@ -381,12 +378,6 @@ class Zappa(object):
         # First, do the project..
         temp_project_path = os.path.join(tempfile.gettempdir(), str(int(time.time())))
 
-        if minify:
-            excludes = ZIP_EXCLUDES + exclude + [split_venv[-1]]
-            copytree(cwd, temp_project_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
-        else:
-            copytree(cwd, temp_project_path, symlinks=False)
-
         # Then, do the site-packages..
         egg_links = []
         temp_package_path = os.path.join(tempfile.gettempdir(), str(int(time.time() + 1)))
@@ -399,7 +390,6 @@ class Zappa(object):
         if minify:
             excludes = ZIP_EXCLUDES + exclude
             copytree(site_packages, temp_package_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
-
         else:
             copytree(site_packages, temp_package_path, symlinks=False)
 
@@ -438,7 +428,7 @@ class Zappa(object):
                             zfile.extractall(temp_package_path)
                     progress.update()
             except Exception:
-                pass # XXX - What should we do here?
+                pass  # XXX - What should we do here?
             progress.close()
 
             # ..then, do lambda-packages.
@@ -452,6 +442,79 @@ class Zappa(object):
                             continue
 
                         tar.extract(member, temp_project_path)
+
+        # Then zip it all up..
+        print("Packaging site-packages as zip..")
+        try:
+            # import zlib
+            compression_method = zipfile.ZIP_DEFLATED
+        except ImportError:  # pragma: no cover
+            compression_method = zipfile.ZIP_STORED
+
+        zipf = zipfile.ZipFile(zip_path, 'w', compression_method)
+        for root, dirs, files in os.walk(temp_project_path):
+
+            for filename in files:
+
+                # If there is a .pyc file in this package,
+                # we can skip the python source code as we'll just
+                # use the compiled bytecode anyway..
+                if filename[-3:] == '.py' and root[-10:] != 'migrations':
+                    abs_filname = os.path.join(root, filename)
+                    abs_pyc_filename = abs_filname + 'c'
+                    if os.path.isfile(abs_pyc_filename):
+
+                        # but only if the pyc is older than the py,
+                        # otherwise we'll deploy outdated code!
+                        py_time = os.stat(abs_filname).st_mtime
+                        pyc_time = os.stat(abs_pyc_filename).st_mtime
+
+                        if pyc_time > py_time:
+                            continue
+
+                zipf.write(os.path.join(root, filename),
+                           os.path.join(root.replace(temp_project_path, ''), filename))
+
+            if '__init__.py' not in files:
+                tmp_init = os.path.join(temp_project_path, '__init__.py')
+                open(tmp_init, 'a').close()
+                zipf.write(tmp_init,
+                           os.path.join(root.replace(temp_project_path, ''),
+                                        os.path.join(root.replace(temp_project_path, ''), '__init__.py')))
+
+        # And, we're done!
+        zipf.close()
+
+        # Trash the temp directory
+        shutil.rmtree(temp_project_path)
+        shutil.rmtree(temp_package_path)
+
+        return zip_fname
+
+    def create_lambda_zip(self, prefix='lambda_package', handler_file=None, exclude=None, include=None):
+        """
+        Create a Lambda-ready zip file of the working directory.
+
+        Returns path to that file.
+
+        """
+
+        cwd = os.getcwd()
+        zip_fname = prefix + '-' + str(int(time.time())) + '.zip'
+        zip_path = os.path.join(cwd, zip_fname)
+
+        # Files that should be excluded from the zip
+        if exclude is None:
+            exclude = list()
+
+        # Exclude the zip itself
+        exclude.append(zip_path)
+
+        # First, do the project..
+        temp_project_path = os.path.join(tempfile.gettempdir(), str(int(time.time())))
+
+        # No need to minify because site-packages is a separate zip now
+        copytree(cwd, temp_project_path, symlinks=False)
 
         # If a handler_file is supplied, copy that to the root of the package,
         # because that's where AWS Lambda looks for it. It can't be inside a package.
@@ -508,7 +571,6 @@ class Zappa(object):
 
         # Trash the temp directory
         shutil.rmtree(temp_project_path)
-        shutil.rmtree(temp_package_path)
 
         # Warn if this is too large for Lambda.
         file_stats = os.stat(zip_path)

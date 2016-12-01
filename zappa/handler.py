@@ -131,6 +131,30 @@ class LambdaHandler(object):
 
             self.wsgi_app = ZappaWSGIMiddleware(wsgi_app_function)
 
+    def load_remote_site_packages(self, s3_path):
+        """
+        Download the site-packages zip from S3, put them in /tmp, and add the folder to your pythonpath
+        """
+        import zip
+
+        bucket, key = s3_path.lstrip('s3://').split('/', 1)
+        if not self.session:
+            boto_session = boto3.Session()
+        else:
+            boto_session = self.session
+
+        s3 = boto_session.resource('s3')
+
+        try:
+            site_packages_object = s3.Object(bucket, key).get()
+        except Exception as e:  # pragma: no cover
+            # catch everything aws might decide to raise
+            print('Could not load site-packages.', e)
+            return
+
+
+        pass
+
     def load_remote_settings(self, remote_bucket, remote_file):
         """
         Attempt to read a file from s3 containing a flat json object. Adds each
@@ -282,6 +306,9 @@ class LambdaHandler(object):
 
         """
         settings = self.settings
+
+        # Load site-packages from S3
+        self.import_site_packages()
 
         # If in DEBUG mode, log all raw incoming events.
         if settings.DEBUG:

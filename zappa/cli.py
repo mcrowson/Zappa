@@ -109,6 +109,7 @@ class ZappaCLI(object):
     s3_bucket_name = None
     settings_file = None
     zip_path = None
+    site_packages_zip_path = None
     vpc_config = None
     memory_size = None
     use_apigateway = None
@@ -365,10 +366,16 @@ class ZappaCLI(object):
         self.create_package()
         self.callback('zip')
 
-        # Upload it to S3
+        # Upload the project and site-packages to S3
         success = self.zappa.upload_to_s3(
-                self.zip_path, self.s3_bucket_name)
-        if not success: # pragma: no cover
+            source_path=self.zip_path,
+            bucket_name=self.s3_bucket_name)
+        site_package_success = self.zappa.upload_to_s3(
+            source_path=self.site_packages_zip_path,
+            bucket_name=self.s3_bucket_name
+        )
+
+        if not success or not site_package_success: # pragma: no cover
             raise ClickException("Unable to upload to S3. Quitting.")
 
         # Register the Lambda function with that zip as the source
@@ -1419,11 +1426,14 @@ class ZappaCLI(object):
 
         # Create the zip file
         self.zip_path = self.zappa.create_lambda_zip(
-                self.lambda_name,
+                prefix=self.lambda_name,
                 handler_file=handler_file,
-                use_precompiled_packages=self.stage_config.get('use_precompiled_packages', True),
                 exclude=self.stage_config.get('exclude', [])
             )
+
+        self.site_packages_zip_path = self.zappa.create_site_packages_zip(
+            use_precompiled_packages=self.stage_config.get('use_precompiled_packages', True),
+        )
 
         # Throw custom setings into the zip file
         with zipfile.ZipFile(self.zip_path, 'a') as lambda_zip:
@@ -1505,6 +1515,8 @@ class ZappaCLI(object):
             if authorizer_function:
                 settings_s += "AUTHORIZER_FUNCTION='{0!s}'\n".format(authorizer_function)
 
+            # S3 site-packages file
+            settings_s += "SITE-PACKAGES=s3://{0!s}/{1!s}\n".format(self.s3_bucket_name, self.site_packages_zip_path)
 
             # Copy our Django app into root of our package.
             # It doesn't work otherwise.
@@ -1530,6 +1542,8 @@ class ZappaCLI(object):
             try:
                 if os.path.isfile(self.zip_path):
                     os.remove(self.zip_path)
+                if os.path.isfile(self.site_packages_zip_path):
+                    os.remove(self.site_packages_zip_path)
             except Exception as e: # pragma: no cover
                 sys.exit(-1)
 
@@ -1541,6 +1555,7 @@ class ZappaCLI(object):
         # Remove the uploaded zip from S3, because it is now registered..
         if self.stage_config.get('delete_s3_zip', True):
             self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
+            self.zappa.remove_from_s3(self.site_packages_zip_path, self.s3_bucket_name)
 
     def print_logs(self, logs, colorize=True, http=False):
         """
