@@ -1530,7 +1530,8 @@ class ZappaCLI(object):
                 settings_s += "AUTHORIZER_FUNCTION='{0!s}'\n".format(authorizer_function)
 
             # Package Zip Path
-            settings_s += "PROJECT_ZIP_PATH='s3://{0!s}/{1!s}'\n".format(self.s3_bucket_name, self.handler_path[-1])
+            settings_s += "PROJECT_ZIP_PATH='s3://{0!s}/{1!s}'\n".format(self.s3_bucket_name,
+                                                                         self.handler_path.split(os.sep)[-1])
 
             # Copy our Django app into root of our package.
             # It doesn't work otherwise.
@@ -1555,6 +1556,8 @@ class ZappaCLI(object):
         if self.stage_config.get('delete_local_zip', True):
             try:
                 if os.path.isfile(self.zip_path):
+                    # TODO Probably want to keep this in S3. There is no guarantee that /tmp will keep it
+                    # Not sure of elegant way to keep them in S3 with versioning yet.
                     os.remove(self.zip_path)
                 if os.path.isfile(self.handler_path):
                     os.remove(self.handler_path)

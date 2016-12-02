@@ -15,17 +15,18 @@ from werkzeug.wrappers import Response
 
 # This file may be copied into a project's root,
 # so handle both scenarios.
-try:
-    from zappa.cli import ZappaCLI
-    from zappa.middleware import ZappaWSGIMiddleware
-    from zappa.wsgi import create_wsgi_request, common_log
-    from zappa.util import parse_s3_url
+#try:
+from zappa.cli import ZappaCLI
+from zappa.middleware import ZappaWSGIMiddleware
+from zappa.wsgi import create_wsgi_request, common_log
+from zappa.util import parse_s3_url
+'''
 except ImportError as e:  # pragma: no cover
     from .cli import ZappaCLI
     from .middleware import ZappaWSGIMiddleware
     from .wsgi import create_wsgi_request, common_log
     from .util import parse_s3_url
-
+'''
 
 # Set up logging
 logging.basicConfig()

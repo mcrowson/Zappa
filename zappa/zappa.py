@@ -369,6 +369,7 @@ class Zappa(object):
             shutil.copy(handler_file, os.path.join(temp_handler_path, filename))
 
         # Find zappa's dependencies
+        # TODO make this recursive for each of the dependencies
         deps = []
         for package in pip.get_installed_distributions():
             if package.project_name == 'zappa':
