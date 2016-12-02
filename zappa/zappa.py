@@ -374,7 +374,7 @@ class Zappa(object):
             if package.project_name == 'zappa':
                 deps.append('zappa')
                 for requirement_package in package.requires():
-                    deps.append(requirement_package.project_name)
+                    deps.append(requirement_package.project_name.lower())
 
         # Pull in zappa and the dependencies
         for dep in deps:
@@ -382,11 +382,17 @@ class Zappa(object):
                 package = os.path.join(venv, 'Lib', 'site-packages', dep)
             else:
                 package = os.path.join(venv, 'lib', 'python2.7', 'site-packages', dep)
-            if minify:
-                excludes = ZIP_EXCLUDES + exclude
-                copytree(package, temp_handler_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
-            else:
-                copytree(package, temp_handler_path, symlinks=False)
+
+            if os.path.isdir(package):
+                if minify:
+                    excludes = ZIP_EXCLUDES + exclude
+                    copytree(package, os.path.join(temp_handler_path, package.split(os.sep)[-1]),
+                             symlinks=False, ignore=shutil.ignore_patterns(*excludes))
+                else:
+                    copytree(package, os.path.join(temp_handler_path, package.split(os.sep)[-1]), symlinks=False)
+            elif os.path.isfile('{0!s}.py'.format(package)):
+                # Just a single file
+                shutil.copy('{0!s}.py'.format(package), os.path.join(temp_handler_path, '{0!s}.py'.format(dep)))
 
         # Then zip it all up..
         try:

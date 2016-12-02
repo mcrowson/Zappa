@@ -34,6 +34,7 @@ import time
 import toml
 import yaml
 import zipfile
+import hashlib
 
 from click.exceptions import ClickException
 from dateutil import parser
@@ -1329,7 +1330,7 @@ class ZappaCLI(object):
         self.remote_env_bucket = self.stage_config.get('remote_env_bucket', None)
         self.remote_env_file = self.stage_config.get('remote_env_file', None)
         self.remote_env = self.stage_config.get('remote_env', None)
-        self.settings_file = self.stage_config.get('settings_file', None)
+        self.settings_file = self.stage_config.get('settings_file', settings_file)
         self.django_settings = self.stage_config.get('django_settings', None)
         self.manage_roles = self.stage_config.get('manage_roles', True)
         self.api_key_required = self.stage_config.get('api_key_required', False)
@@ -1530,7 +1531,6 @@ class ZappaCLI(object):
 
             # Package Zip Path
             settings_s += "PROJECT_ZIP_PATH='s3://{0!s}/{1!s}'\n".format(self.s3_bucket_name, self.handler_path[-1])
-
 
             # Copy our Django app into root of our package.
             # It doesn't work otherwise.

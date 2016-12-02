@@ -1009,7 +1009,6 @@ USE_TZ = True
         remote_bucket, remote_file = parse_s3_url('/dev/null')
         self.assertEqual(remote_bucket, '')
 
-
     def test_remote_env_package(self):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = 'depricated_remote_env'
@@ -1017,7 +1016,7 @@ USE_TZ = True
         self.assertEqual('lmbda-env', zappa_cli.stage_config['remote_env_bucket'])
         self.assertEqual('dev/env.json', zappa_cli.stage_config['remote_env_file'])
         zappa_cli.create_package()
-        with zipfile.ZipFile(zappa_cli.zip_path, 'r') as lambda_zip:
+        with zipfile.ZipFile(zappa_cli.handler_path, 'r') as lambda_zip:
             content = lambda_zip.read('zappa_settings.py')
         zappa_cli.remove_local_zip()
         m = re.search("REMOTE_ENV='(.*)'", content)
@@ -1028,7 +1027,7 @@ USE_TZ = True
         zappa_cli.load_settings('test_settings.json')
         self.assertEqual('s3://lmbda-env/prod/env.json', zappa_cli.stage_config['remote_env'])
         zappa_cli.create_package()
-        with zipfile.ZipFile(zappa_cli.zip_path, 'r') as lambda_zip:
+        with zipfile.ZipFile(zappa_cli.handler_path, 'r') as lambda_zip:
             content = lambda_zip.read('zappa_settings.py')
         zappa_cli.remove_local_zip()
         m = re.search("REMOTE_ENV='(.*)'", content)
