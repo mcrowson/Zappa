@@ -4,6 +4,8 @@ import os
 import requests
 import shutil
 import stat
+import urlparse
+
 
 def copytree(src, dst, symlinks=False, ignore=None):
     """
@@ -157,6 +159,7 @@ def get_event_source(event_source, lambda_arn, target_function, boto_session, dr
         arn_back = split_arn[-1]
         ctx.environment = arn_back
         funk.arn = arn_front
+        funk.name = ':'.join([arn_back, target_function])
     else:
         funk.arn = lambda_arn
 
@@ -224,3 +227,17 @@ def check_new_version_available(this_version):
         return True
     else:
         return False
+
+def parse_s3_url(url):
+    """
+    Parses S3 URL.
+
+    Returns bucket (domain) and file (full path).
+    """
+    bucket = ''
+    path = ''
+    if url:
+        result = urlparse.urlparse(url)
+        bucket = result.netloc
+        path = result.path.strip('/')
+    return bucket, path

@@ -31,12 +31,17 @@ import string
 import sys
 import tempfile
 import time
+import toml
+import yaml
 import zipfile
+
 from click.exceptions import ClickException
 from dateutil import parser
 from datetime import datetime,timedelta
 from zappa import Zappa, logger, API_GATEWAY_REGIONS
-from util import check_new_version_available, detect_django_settings, detect_flask_apps
+from util import (check_new_version_available, detect_django_settings,
+                  detect_flask_apps, parse_s3_url)
+
 
 CUSTOM_SETTINGS = [
     'assume_policy',
@@ -123,22 +128,33 @@ class ZappaCLI(object):
         A shortcut property for settings of a stage.
         """
 
-        # Load any common extentions
-        # TODO: Make recursive
-        extends = self.zappa_settings[self.api_stage].get('extends', None)
-        if extends:
+        def get_stage_setting(stage, extended_stages=None):
+            if extended_stages is None:
+                extended_stages = []
+
+            if stage in extended_stages:
+                raise RuntimeError(stage + " has already been extended to these settings. "
+                                           "There is a circular extends within the settings file.")
+            extended_stages.append(stage)
+
             try:
-                settings_to_extend = self.zappa_settings[extends].copy()
+                stage_settings = dict(self.zappa_settings[stage].copy())
             except KeyError:
-                raise ClickException("Cannot extend settings for undefined environment '" + extends + "'.")
-            settings_to_extend.update(self.zappa_settings[self.api_stage])
-            settings = settings_to_extend
-        else:
-            settings = self.zappa_settings[self.api_stage].copy()
+                raise ClickException("Cannot extend settings for undefined environment '" + stage + "'.")
+
+            extends_stage = self.zappa_settings[stage].get('extends', None)
+            if not extends_stage:
+                return stage_settings
+            extended_settings = get_stage_setting(stage=extends_stage, extended_stages=extended_stages)
+            extended_settings.update(stage_settings)
+            return extended_settings
+
+        settings = get_stage_setting(stage=self.api_stage)
 
         # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
         if u'delete_zip' in settings:
             settings[u'delete_local_zip'] = settings.get(u'delete_zip')
+
         return settings
 
     def handle(self, argv=None):
@@ -148,14 +164,14 @@ class ZappaCLI(object):
         Parses command, load settings and dispatches accordingly.
 
         """
-        help_message = ("Please supply a command to execute. " +
-                       "Can be one of: {}".format(', '.join(x for x in sorted(CLI_COMMANDS))))
+        help_message = ("Please supply a valid command to execute. " +
+                       "Can be one of: {}.".format(', '.join(click.style(x, fg='green', bold=True) for x in sorted(CLI_COMMANDS))))
 
         parser = argparse.ArgumentParser(description='Zappa - Deploy Python applications to AWS Lambda and API Gateway.\n')
         parser.add_argument('command_env', metavar='U', type=str, nargs='*', help=help_message)
         parser.add_argument('-n', '--num-rollback', type=int, default=0,
                             help='The number of versions to rollback.')
-        parser.add_argument('-s', '--settings_file', type=str, default='zappa_settings.json',
+        parser.add_argument('-s', '--settings_file', type=str, default=None,
                             help='The path to a zappa settings file.')
         parser.add_argument('-a', '--app_function', type=str, default=None,
                             help='The WSGI application function.')
@@ -169,6 +185,10 @@ class ZappaCLI(object):
                             default=False)
         parser.add_argument('--no-cleanup', action='store_true',
                             help="Don't remove certificate files from /tmp during certify. Dangerous.", default=False)
+        parser.add_argument('--no-color', action='store_true',
+                            help="Don't color log tail output.", default=False)
+        parser.add_argument('--http', action='store_true',
+                            help="Only show HTTP requests in tail output", default=False)
         parser.add_argument('--all', action='store_true',
                             help="Execute this command for all of our defined Zappa environments.", default=False)
         parser.add_argument('--json', action='store_true', help='Returns status in JSON format',
@@ -193,7 +213,7 @@ class ZappaCLI(object):
         self.command = self.command_env[0]
 
         if self.command not in CLI_COMMANDS:
-            print("The command '{}' is not recognized. {}".format(self.command, help_message))
+            print("The command '{}' is not recognized. {}".format(click.style(self.command, fg='red', bold=True), help_message))
             return
 
         # We don't have any settings yet, so make those first!
@@ -217,14 +237,13 @@ class ZappaCLI(object):
         if all_environments: # All envs!
             environments = self.zappa_settings.keys()
         else: # Just one env.
-            if len(self.command_env) < 2: # pragma: no cover
+            if len(self.command_env) < 2:
                 # If there's only one environment defined in the settings,
                 # use that as the default.
                 if len(self.zappa_settings.keys()) is 1:
                     environments.append(self.zappa_settings.keys()[0])
                 else:
                     parser.error("Please supply an environment to interact with.")
-                    sys.exit(1)
             else:
                 environments.append(self.command_env[1])
 
@@ -297,7 +316,7 @@ class ZappaCLI(object):
             self.invoke(command, command="manage")
 
         elif command == 'tail': # pragma: no cover
-            self.tail()
+            self.tail(colorize=(not self.vargs['no_color']), http=self.vargs['http'])
         elif command == 'undeploy': # pragma: no cover
             self.undeploy(noconfirm=self.vargs['yes'], remove_logs=self.vargs['remove_logs'])
         elif command == 'schedule': # pragma: no cover
@@ -340,7 +359,7 @@ class ZappaCLI(object):
                     "You may " + click.style("lack the necessary AWS permissions", bold=True) +
                     " to automatically manage a Zappa execution role.\n" +
                     "To fix this, see here: " +
-                    click.style("https://github.com/Miserlou/Zappa#using-custom-aws-iam-roles-and-policie", bold=True)
+                    click.style("https://github.com/Miserlou/Zappa#using-custom-aws-iam-roles-and-policies", bold=True)
                     + '\n')
 
         # Create the Lambda Zip
@@ -385,7 +404,8 @@ class ZappaCLI(object):
                                                         self.api_key_required,
                                                         self.integration_content_type_aliases,
                                                         self.iam_authorization,
-                                                        self.authorizer)
+                                                        self.authorizer,
+                                                        self.cors)
 
             self.zappa.update_stack(self.lambda_name, self.s3_bucket_name, wait=True)
 
@@ -501,7 +521,8 @@ class ZappaCLI(object):
                                              self.api_key_required,
                                              self.integration_content_type_aliases,
                                              self.iam_authorization,
-                                             self.authorizer)
+                                             self.authorizer,
+                                             self.cors)
             self.zappa.update_stack(self.lambda_name, self.s3_bucket_name, wait=True, update_only=True)
 
             api_id = self.zappa.get_api_id(self.lambda_name)
@@ -552,7 +573,7 @@ class ZappaCLI(object):
             self.lambda_name, versions_back=revision)
         print("Done!")
 
-    def tail(self, keep_open=True):
+    def tail(self, keep_open=True, colorize=True, http=False):
         """
         Tail this function's logs.
 
@@ -561,7 +582,7 @@ class ZappaCLI(object):
         try:
             # Tail the available logs
             all_logs = self.zappa.fetch_logs(self.lambda_name)
-            self.print_logs(all_logs)
+            self.print_logs(all_logs, colorize, http)
 
             # Keep polling, and print any new logs.
             loop = True
@@ -572,7 +593,7 @@ class ZappaCLI(object):
                     if log not in all_logs:
                         new_logs.append(log)
 
-                self.print_logs(new_logs)
+                self.print_logs(new_logs, colorize, http)
                 all_logs = all_logs + new_logs
                 if not keep_open:
                     loop = False
@@ -810,7 +831,7 @@ class ZappaCLI(object):
         status_dict["Error Rate (24h)"] = error_rate
 
         # URLs
-        if self.zappa_settings[self.api_stage].get('use_apigateway', True):
+        if self.use_apigateway:
             api_url = self.zappa.get_api_url(
                 self.lambda_name,
                 self.api_stage)
@@ -833,12 +854,16 @@ class ZappaCLI(object):
         # Scheduled Events
         event_rules = self.zappa.get_event_rules_for_lambda(lambda_name=self.lambda_name)
         status_dict["Num. Event Rules"] = len(event_rules)
+        if len(event_rules) > 0:
+            status_dict['Events'] = []
         for rule in event_rules:
+            event_dict = {}
             rule_name = rule['Name']
-            status_dict["Event Rule Name"] = rule_name
-            status_dict["Event Rule Schedule"] = rule.get(u'ScheduleExpression', None)
-            status_dict["Event Rule State"] = rule.get(u'State', None).title()
-            status_dict["Event Rule ARN"] = rule.get(u'Arn', None)
+            event_dict["Event Rule Name"] = rule_name
+            event_dict["Event Rule Schedule"] = rule.get(u'ScheduleExpression', None)
+            event_dict["Event Rule State"] = rule.get(u'State', None).title()
+            event_dict["Event Rule ARN"] = rule.get(u'Arn', None)
+            status_dict['Events'].append(event_dict)
 
         if return_json:
             # Putting the status in machine readable format
@@ -847,7 +872,13 @@ class ZappaCLI(object):
         else:
             click.echo("Status for " + click.style(self.lambda_name, bold=True) + ": ")
             for k, v in status_dict.items():
-                tabular_print(k, v)
+                if k == 'Events':
+                    # Events are a list of dicts
+                    for event in v:
+                        for item_k, item_v in event.items():
+                            tabular_print(item_k, item_v)
+                else:
+                    tabular_print(k, v)
 
         # TODO: S3/SQS/etc. type events?
 
@@ -1093,7 +1124,7 @@ class ZappaCLI(object):
         # Give warning on --no-cleanup
         if no_cleanup:
             clean_up = False
-            click.echo(click.style("Warning!", fg="yellow", bold=True) + " You are calling certify with " +
+            click.echo(click.style("Warning!", fg="red", bold=True) + " You are calling certify with " +
                        click.style("--no-cleanup", bold=True) +
                        ". Your certificate files will remain in the system temporary directory after this command exectutes!")
         else:
@@ -1121,9 +1152,8 @@ class ZappaCLI(object):
             if not account_key_location:
                 raise ClickException("Can't certify a domain without " + click.style("lets_encrypt_key", fg="red", bold=True) + " configured!")
 
-            if 's3://' in account_key_location:
-                bucket = account_key_location.split('s3://')[1].split('/')[0]
-                key_name = account_key_location.split('s3://')[1].split('/')[1]
+            if account_key_location.startswith('s3://'):
+                bucket, key_name = parse_s3_url(account_key_location)
                 self.zappa.s3_client.download_file(bucket, key_name, '/tmp/account.key')
             else:
                 from shutil import copyfile
@@ -1229,9 +1259,9 @@ class ZappaCLI(object):
             print(e)
             return
 
-    def load_settings(self, settings_file="zappa_settings.json", session=None):
+    def load_settings(self, settings_file=None, session=None):
         """
-        Load the local zappa_settings.json file.
+        Load the local zappa_settings file.
 
         An existing boto session can be supplied, though this is likely for testing purposes.
 
@@ -1239,6 +1269,8 @@ class ZappaCLI(object):
         """
 
         # Ensure we're passed a valid settings file.
+        if not settings_file:
+            settings_file = self.get_json_or_yaml_settings()
         if not os.path.isfile(settings_file):
             raise ClickException("Please configure your zappa_settings file.")
 
@@ -1283,17 +1315,27 @@ class ZappaCLI(object):
         self.log_level = self.stage_config.get('log_level', "DEBUG")
         self.domain = self.stage_config.get('domain', None)
         self.timeout_seconds = self.stage_config.get('timeout_seconds', 30)
+
+        # Provide legacy support for `use_apigateway`, now `apigateway_enabled`.
+        # https://github.com/Miserlou/Zappa/issues/490
+        # https://github.com/Miserlou/Zappa/issues/493
         self.use_apigateway = self.stage_config.get('use_apigateway', True)
+        if self.use_apigateway:
+            self.use_apigateway = self.stage_config.get('apigateway_enabled', True)
+
         self.integration_content_type_aliases = self.stage_config.get('integration_content_type_aliases', {})
         self.lambda_handler = self.stage_config.get('lambda_handler', 'handler.lambda_handler')
+        # DEPRICATED. https://github.com/Miserlou/Zappa/issues/456
         self.remote_env_bucket = self.stage_config.get('remote_env_bucket', None)
         self.remote_env_file = self.stage_config.get('remote_env_file', None)
-        self.settings_file = self.stage_config.get('settings_file', settings_file)
+        self.remote_env = self.stage_config.get('remote_env', None)
+        self.settings_file = self.stage_config.get('settings_file', None)
         self.django_settings = self.stage_config.get('django_settings', None)
         self.manage_roles = self.stage_config.get('manage_roles', True)
         self.api_key_required = self.stage_config.get('api_key_required', False)
         self.api_key = self.stage_config.get('api_key')
         self.iam_authorization = self.stage_config.get('iam_authorization', False)
+        self.cors = self.stage_config.get("cors", None)
         self.lambda_description = self.stage_config.get('lambda_description', "Zappa Deployment")
         self.environment_variables = self.stage_config.get('environment_variables', {})
         self.check_environment(self.environment_variables)
@@ -1317,21 +1359,64 @@ class ZappaCLI(object):
         if self.app_function:
             self.collision_warning(self.app_function)
             if self.app_function[-3:] == '.py':
-                click.echo(click.style("Warning!", fg="yellow", bold=True) +
+                click.echo(click.style("Warning!", fg="red", bold=True) +
                            " Your app_function is pointing to a " + click.style("file and not a function", bold=True) +
                            "! It should probably be something like 'my_file.app', not 'my_file.py'!")
 
         return self.zappa
 
-    def load_settings_file(self, settings_file="zappa_settings.json"):
+    def get_json_or_yaml_settings(self, settings_name="zappa_settings"):
+        """
+        Return zappa_settings path as JSON or YAML (or TOML), as appropriate.
+        """
+        zs_json = settings_name + ".json"
+        zs_yaml = settings_name + ".yml"
+        zs_toml = settings_name + ".toml"
+
+        # Must have at least one
+        if not os.path.isfile(zs_json) \
+            and not os.path.isfile(zs_yaml) \
+            and not os.path.isfile(zs_toml):
+            raise ClickException("Please configure a zappa_settings file.")
+
+        # Prefer JSON
+        if os.path.isfile(zs_json):
+            settings_file = zs_json
+        elif os.path.isfile(zs_toml):
+            settings_file = zs_toml
+        else:
+            settings_file = zs_yaml
+
+        return settings_file
+
+    def load_settings_file(self, settings_file=None):
         """
         Load our settings file.
         """
-        with open(settings_file) as json_file:
-            try:
-                self.zappa_settings = json.load(json_file)
-            except ValueError:
-                raise ValueError("Unable to load the zappa settings JSON. It may be malformed.")
+
+        if not settings_file:
+            settings_file = self.get_json_or_yaml_settings()
+        if not os.path.isfile(settings_file):
+            raise ClickException("Please configure your zappa_settings file.")
+
+        if '.yml' in settings_file:
+            with open(settings_file) as yaml_file:
+                try:
+                    self.zappa_settings = yaml.load(yaml_file)
+                except ValueError: # pragma: no cover
+                    raise ValueError("Unable to load the Zappa settings YAML. It may be malformed.")
+        elif '.toml' in settings_file:
+            with open(settings_file) as toml_file:
+                try:
+                    self.zappa_settings = toml.load(toml_file)
+                except ValueError: # pragma: no cover
+                    raise ValueError("Unable to load the Zappa settings TOML. It may be malformed.")
+        else:
+            with open(settings_file) as json_file:
+                try:
+                    self.zappa_settings = json.load(json_file)
+                except ValueError: # pragma: no cover
+                    raise ValueError("Unable to load the Zappa settings JSON. It may be malformed.")
 
     def create_package(self):
         """
@@ -1369,6 +1454,9 @@ class ZappaCLI(object):
             settings_s = "# Generated by Zappa\n"
 
             if self.app_function:
+                if '.' not in self.app_function: # pragma: no cover
+                    raise ClickException("Your " + click.style("app_function", fg='red', bold=True) + " value is not a modular path." +
+                        " It needs to be in the format `" + click.style("your_module.your_app_object", bold=True) + "`.")
                 app_module, app_function = self.app_function.rsplit('.', 1)
                 settings_s = settings_s + "APP_MODULE='{0!s}'\nAPP_FUNCTION='{1!s}'\n".format(app_module, app_function)
 
@@ -1392,12 +1480,14 @@ class ZappaCLI(object):
                 settings_s = settings_s + "DOMAIN=None\n"
 
             # Pass through remote config bucket and path
-            if self.remote_env_bucket and self.remote_env_file:
-                settings_s = settings_s + "REMOTE_ENV_BUCKET='{0!s}'\n".format(
-                    self.remote_env_bucket
+            if self.remote_env:
+                settings_s = settings_s + "REMOTE_ENV='{0!s}'\n".format(
+                    self.remote_env
                 )
-                settings_s = settings_s + "REMOTE_ENV_FILE='{0!s}'\n".format(
-                    self.remote_env_file
+            # DEPRICATED. use remove_env instead
+            elif self.remote_env_bucket and self.remote_env_file:
+                settings_s = settings_s + "REMOTE_ENV='s3://{0!s}/{1!s}'\n".format(
+                    self.remote_env_bucket, self.remote_env_file
                 )
 
             # Local envs
@@ -1481,7 +1571,7 @@ class ZappaCLI(object):
             self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
             self.zappa.remove_from_s3(self.handler_path, self.s3_bucket_name)
 
-    def print_logs(self, logs):
+    def print_logs(self, logs, colorize=True, http=False):
         """
         Parse, filter and print logs to the console.
 
@@ -1497,7 +1587,104 @@ class ZappaCLI(object):
             if "END RequestId" in message:
                 continue
 
-            print("[" + str(timestamp) + "] " + message.strip())
+            if not colorize:
+                if http:
+                    if self.is_http_log_entry(message.strip()):
+                        print("[" + str(timestamp) + "] " + message.strip())
+                else:
+                    print("[" + str(timestamp) + "] " + message.strip())
+            else:
+                if http:
+                    if self.is_http_log_entry(message.strip()):
+                        click.echo(click.style("[", fg='cyan') + click.style(str(timestamp), bold=True) + click.style("]", fg='cyan') + self.colorize_log_entry(message.strip()))
+                else:
+                    click.echo(click.style("[", fg='cyan') + click.style(str(timestamp), bold=True) + click.style("]", fg='cyan') + self.colorize_log_entry(message.strip()))
+
+    def is_http_log_entry(self, string):
+        """
+        Determines if a log entry is an HTTP-formatted log string or not.
+        """
+        # Debug event filter
+        if 'Zappa Event' in string:
+            return False
+
+        # IP address filter
+        for token in string.replace('\t', ' ').split(' '):
+            try:
+                if (token.count('.') is 3 and token.replace('.', '').isnumeric()):
+                    return True
+            except Exception: # pragma: no cover
+                pass
+
+        return False
+
+    def colorize_log_entry(self, string):
+        """
+        Apply various heuristics to return a colorized version of a string.
+        If these fail, simply return the string in plaintext.
+        """
+
+        final_string = string
+        try:
+
+            # First, do stuff in square brackets
+            inside_squares = re.findall(r'\[([^]]*)\]', string)
+            for token in inside_squares:
+                if token in ['CRITICAL', 'ERROR', 'WARNING', 'DEBUG', 'INFO', 'NOTSET']:
+                    final_string = final_string.replace('[' + token + ']', click.style("[", fg='cyan') + click.style(token, fg='cyan', bold=True) + click.style("]", fg='cyan'))
+                else:
+                    final_string = final_string.replace('[' + token + ']', click.style("[", fg='cyan') + click.style(token, bold=True) + click.style("]", fg='cyan'))
+
+            # Then do quoted strings
+            quotes = re.findall(r'"[^"]*"', string)
+            for token in quotes:
+                final_string = final_string.replace(token, click.style(token, fg="yellow"))
+
+            # And UUIDs
+            for token in final_string.replace('\t', ' ').split(' '):
+                try:
+                    if token.count('-') is 4 and token.replace('-', '').isalnum():
+                        final_string = final_string.replace(token, click.style(token, fg="magenta"))
+                except Exception: # pragma: no cover
+                    pass
+
+                # And IP addresses
+                try:
+                    if token.count('.') is 3 and token.replace('.', '').isnumeric():
+                        final_string = final_string.replace(token, click.style(token, fg="red"))
+                except Exception: # pragma: no cover
+                    pass
+
+                # And status codes
+                try:
+                    if token in ['200']:
+                        final_string = final_string.replace(token, click.style(token, fg="green"))
+                    if token in ['400', '401', '403', '404', '405', '500']:
+                        final_string = final_string.replace(token, click.style(token, fg="red"))
+                except Exception: # pragma: no cover
+                    pass
+
+            # And Zappa Events
+            try:
+                if "Zappa Event:" in final_string:
+                    final_string = final_string.replace("Zappa Event:", click.style("Zappa Event:", bold=True, fg="green"))
+            except Exception: # pragma: no cover
+                pass
+
+            # And dates
+            for token in final_string.split('\t'):
+                try:
+                    is_date = parser.parse(token)
+                    final_string = final_string.replace(token, click.style(token, fg="green"))
+                except Exception: # pragma: no cover
+                    pass
+
+            final_string = final_string.replace('\t', ' ').replace('   ', ' ')
+            if final_string[0] != ' ':
+                final_string = ' ' + final_string
+            return final_string
+        except Exception as e: # pragma: no cover
+            return string
 
     def execute_prebuild_script(self):
         """
@@ -1531,7 +1718,7 @@ class ZappaCLI(object):
         ]
         for namespace_collision in namespace_collisions:
             if namespace_collision in item:
-                click.echo(click.style("Warning!", fg="yellow", bold=True) +
+                click.echo(click.style("Warning!", fg="red", bold=True) +
                            " You may have a namespace collision with " + click.style(item, bold=True) +
                            "! You may want to rename that file.")
 
