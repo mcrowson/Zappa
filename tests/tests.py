@@ -11,7 +11,7 @@ import unittest
 from click.exceptions import ClickException
 from lambda_packages import lambda_packages
 
-from .utils import placebo_session
+from utils import placebo_session
 
 from zappa.cli import ZappaCLI, shamelessly_promote
 from zappa.ext.django_zappa import get_django_wsgi

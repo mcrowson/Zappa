@@ -8,7 +8,7 @@ import os
 import json
 import inspect
 import collections
-
+import zipfile
 import boto3
 import sys
 from werkzeug.wrappers import Response
@@ -62,7 +62,6 @@ class LambdaHandler(object):
     settings = None
     settings_name = None
     session = None
-    project_loaded = False
 
     # Application
     app_module = None
@@ -129,37 +128,43 @@ class LambdaHandler(object):
 
             self.wsgi_app = ZappaWSGIMiddleware(wsgi_app_function)
 
-        if not self.project_loaded:
-            self.project_loaded = self.load_project_zip()
+        self.load_project_dir()
 
-    def load_project_zip(self):
+    def load_project_dir(self):
         """
         Puts the project files from S3 in /tmp, then adds them to PYTHONPATH
         """
-        if not self.session:
-            boto_session = boto3.Session()
-        else:
-            boto_session = self.session
+        project_folder = '/tmp/{0!s}'.format(self.settings.PROJECT_NAME)
+        if not os.path.isdir(project_folder):
+            # The project folder does not exist
+            if not self.session:
+                boto_session = boto3.Session()
+            else:
+                boto_session = self.session
 
-        if not self.settings:
-            print('Do not have the settings file to load the project zip path from.')
-            return False
+            if not self.settings:
+                print('Do not have the settings file to load the project zip path from.')
+                return False
 
-        # Download the zip file
-        s3_path = self.settings.PROJECT_ZIP_PATH
-        remote_bucket, remote_file = s3_path.lstrip('s3://').split('/', 1)
-        s3 = boto_session.resource('s3')
-        try:
-            zip_path = '/tmp/{0!s}'.format(remote_file)
-            project_zip = s3.Object(remote_bucket, remote_file).download_file(zip_path)
-        except Exception as e:  # pragma: no cover
-            # catch everything aws might decide to raise
-            print('Could not load project zip', e)
-            return False
+            # Download the zip file
+            s3_path = self.settings.PROJECT_ZIP_PATH
+            remote_bucket, remote_file = s3_path.lstrip('s3://').split('/', 1)
+            s3 = boto_session.resource('s3')
+            try:
+                zip_path = '/tmp/{0!s}'.format(remote_file)
+                s3.Object(remote_bucket, remote_file).download_file(zip_path)
+            except Exception as e:  # pragma: no cover
+                # catch everything aws might decide to raise
+                print('Could not load project zip', e)
+                return False
 
-        # Unzip the contents to /tmp
+            # Unzip the contents to /tmp
 
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(path=project_folder)
 
+        # Add the project to path
+        sys.path.insert(0, project_folder)
 
         return True
 

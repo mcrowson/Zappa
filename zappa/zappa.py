@@ -332,6 +332,7 @@ class Zappa(object):
         zip_path = os.path.join(cwd, zip_fname)
 
         temp_handler_path = os.path.join(tempfile.gettempdir(), str(int(time.time())))
+        os.mkdir(temp_handler_path)
 
         # Files that should be excluded from the zip
         if exclude is None:
@@ -339,7 +340,9 @@ class Zappa(object):
 
         # Lambda just needs the settings file and the user's Zappa library
         settings_name = settings_file.split(os.sep)[-1]
-        shutil.copy(settings_file, os.path.join(temp_handler_path, settings_name))
+        src = os.path.join(cwd, settings_file)
+        dest = os.path.join(temp_handler_path, settings_name)
+        shutil.copy(src, dest)
 
         # If a handler_file is supplied, copy that to the root of the package,
         # because that's where AWS Lambda looks for it. It can't be inside a package.
@@ -348,9 +351,10 @@ class Zappa(object):
             shutil.copy(handler_file, os.path.join(temp_handler_path, filename))
 
         # Find zappa's dependencies
-        deps = ['zappa']
+        deps = []
         for package in pip.get_installed_distributions():
             if package.project_name == 'zappa':
+                deps.append('zappa')
                 for requirement_package in package.requires():
                     deps.append(requirement_package.project_name)
 

@@ -1288,7 +1288,7 @@ class ZappaCLI(object):
         self.lambda_handler = self.stage_config.get('lambda_handler', 'handler.lambda_handler')
         self.remote_env_bucket = self.stage_config.get('remote_env_bucket', None)
         self.remote_env_file = self.stage_config.get('remote_env_file', None)
-        self.settings_file = self.stage_config.get('settings_file', None)
+        self.settings_file = self.stage_config.get('settings_file', settings_file)
         self.django_settings = self.stage_config.get('django_settings', None)
         self.manage_roles = self.stage_config.get('manage_roles', True)
         self.api_key_required = self.stage_config.get('api_key_required', False)
@@ -1327,7 +1327,6 @@ class ZappaCLI(object):
         """
         Load our settings file.
         """
-
         with open(settings_file) as json_file:
             try:
                 self.zappa_settings = json.load(json_file)
@@ -1348,13 +1347,6 @@ class ZappaCLI(object):
             inspect.getfile(inspect.currentframe())))
         handler_file = os.sep.join(current_file.split(os.sep)[0:]) + os.sep + 'handler.py'
 
-        # Create the handler zip file
-        self.handler_path = self.zappa.create_handler_zip(
-            prefix=self.lambda_name,
-            handler_file=handler_file,
-            exclude=self.stage_config.get('exclude', [])
-        )
-
         # Create the package zip file
         self.zip_path = self.zappa.create_lambda_zip(
                 self.lambda_name,
@@ -1362,6 +1354,14 @@ class ZappaCLI(object):
                 use_precompiled_packages=self.stage_config.get('use_precompiled_packages', True),
                 exclude=self.stage_config.get('exclude', [])
             )
+
+        # Create the handler zip file
+        self.handler_path = self.zappa.create_handler_zip(
+            settings_file=self.settings_file,
+            prefix='zappa-handler',
+            handler_file=handler_file,
+            exclude=self.stage_config.get('exclude', [])
+        )
 
         # Throw custom setings into the zip file
         with zipfile.ZipFile(self.handler_path, 'a') as lambda_zip:
