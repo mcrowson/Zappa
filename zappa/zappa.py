@@ -14,7 +14,7 @@ import time
 import zipfile
 import troposphere
 import troposphere.apigateway
-
+import pkg_resources
 from distutils.dir_util import copy_tree
 
 from botocore.exceptions import ClientError
@@ -299,6 +299,123 @@ class Zappa(object):
     # Packaging
     ##
 
+    def create_handler_zip(self, prefix='lambda_package', venv=None, minify=True,
+                           handler_file=None, settings_file='zappa_settings.json', exclude=None):
+        """
+        Creates the handler zip for lambda. Only the handler and files necessary to pull the project from S3 are in
+        this zip. The file path is returned.
+        """
+        import pip
+
+        if not venv:
+            if 'VIRTUAL_ENV' in os.environ:
+                venv = os.environ['VIRTUAL_ENV']
+            elif os.path.exists('.python-version'):  # pragma: no cover
+                logger.debug("Pyenv's local virtualenv detected.")
+                try:
+                    subprocess.check_output('pyenv', stderr=subprocess.STDOUT)
+                except OSError:
+                    print("This directory seems to have pyenv's local venv"
+                          "but pyenv executable was not found.")
+                with open('.python-version', 'r') as f:
+                    env_name = f.read()[:-1]
+                    logger.debug('env name = {}'.format(env_name))
+                bin_path = subprocess.check_output(['pyenv', 'which', 'python']).decode('utf-8')
+                venv = bin_path[:bin_path.rfind(env_name)] + env_name
+                logger.debug('env path = {}'.format(venv))
+            else:  # pragma: no cover
+                print("Zappa requires an active virtual environment.")
+                quit()
+
+        cwd = os.getcwd()
+        zip_fname = prefix + '-' + str(int(time.time())) + '.zip'
+        zip_path = os.path.join(cwd, zip_fname)
+
+        temp_handler_path = os.path.join(tempfile.gettempdir(), str(int(time.time())))
+
+        # Files that should be excluded from the zip
+        if exclude is None:
+            exclude = list()
+
+        # Lambda just needs the settings file and the user's Zappa library
+        settings_name = settings_file.split(os.sep)[-1]
+        shutil.copy(settings_file, os.path.join(temp_handler_path, settings_name))
+
+        # If a handler_file is supplied, copy that to the root of the package,
+        # because that's where AWS Lambda looks for it. It can't be inside a package.
+        if handler_file:
+            filename = handler_file.split(os.sep)[-1]
+            shutil.copy(handler_file, os.path.join(temp_handler_path, filename))
+
+        # Find zappa's dependencies
+        deps = ['zappa']
+        for package in pip.get_installed_distributions():
+            if package.project_name == 'zappa':
+                for requirement_package in package.requires():
+                    deps.append(requirement_package.project_name)
+
+        # Pull in zappa and the dependencies
+        for dep in deps:
+            if os.sys.platform == 'win32':
+                package = os.path.join(venv, 'Lib', 'site-packages', dep)
+            else:
+                package = os.path.join(venv, 'lib', 'python2.7', 'site-packages', dep)
+            if minify:
+                excludes = ZIP_EXCLUDES + exclude
+                copytree(package, temp_handler_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
+            else:
+                copytree(package, temp_handler_path, symlinks=False)
+
+        # Then zip it all up..
+        try:
+            # import zlib
+            compression_method = zipfile.ZIP_DEFLATED
+        except ImportError:  # pragma: no cover
+            compression_method = zipfile.ZIP_STORED
+
+        zipf = zipfile.ZipFile(zip_path, 'w', compression_method)
+        for root, dirs, files in os.walk(temp_handler_path):
+
+            for filename in files:
+                # If there is a .pyc file in this package,
+                # we can skip the python source code as we'll just
+                # use the compiled bytecode anyway..
+                if filename[-3:] == '.py':
+                    abs_filname = os.path.join(root, filename)
+                    abs_pyc_filename = abs_filname + 'c'
+                    if os.path.isfile(abs_pyc_filename):
+
+                        # but only if the pyc is older than the py,
+                        # otherwise we'll deploy outdated code!
+                        py_time = os.stat(abs_filname).st_mtime
+                        pyc_time = os.stat(abs_pyc_filename).st_mtime
+
+                        if pyc_time > py_time:
+                            continue
+
+                zipf.write(os.path.join(root, filename),
+                           os.path.join(root.replace(temp_handler_path, ''), filename))
+
+            if '__init__.py' not in files:
+                tmp_init = os.path.join(temp_handler_path, '__init__.py')
+                open(tmp_init, 'a').close()
+                zipf.write(tmp_init,
+                           os.path.join(root.replace(temp_handler_path, ''),
+                                        os.path.join(root.replace(temp_handler_path, ''), '__init__.py')))
+
+        # And, we're done!
+        zipf.close()
+
+        # Trash the temp directory
+        shutil.rmtree(temp_handler_path)
+
+        # Warn if this is too large for Lambda.
+        file_stats = os.stat(zip_path)
+        if file_stats.st_size > 52428800:  # pragma: no cover
+            print("\n\nWarning: Application zip package is likely to be too large for AWS Lambda.\n\n")
+
+        return zip_fname
+
     def create_lambda_zip(self, prefix='lambda_package', handler_file=None,
                           minify=True, exclude=None, use_precompiled_packages=True, include=None, venv=None):
         """
@@ -464,11 +581,6 @@ class Zappa(object):
         # Trash the temp directory
         shutil.rmtree(temp_project_path)
         shutil.rmtree(temp_package_path)
-
-        # Warn if this is too large for Lambda.
-        file_stats = os.stat(zip_path)
-        if file_stats.st_size > 52428800:  # pragma: no cover
-            print("\n\nWarning: Application zip package is likely to be too large for AWS Lambda.\n\n")
 
         return zip_fname
 
