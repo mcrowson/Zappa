@@ -19,6 +19,7 @@ import time
 import troposphere
 import troposphere.apigateway
 import zipfile
+import pip
 
 from distutils.dir_util import copy_tree
 
@@ -317,13 +318,23 @@ class Zappa(object):
             for link in glob.glob(os.path.join(temp_package_path, "*.egg-link")):
                 os.remove(link)
 
+    # Find dependencies of a package recursively
+    def get_deps_list(self, pkg_name, installed_distros=None):
+        deps = [pkg_name.lower()]
+        if not installed_distros:
+            installed_distros = pip.get_installed_distributions()
+        for package in installed_distros:
+            if package.project_name.lower() == pkg_name.lower():
+                for req in package.requires():
+                    deps += self.get_deps_list(pkg_name=req.project_name, installed_distros=installed_distros)
+        return list(set(deps))  # Dedupe before returning
+
     def create_handler_zip(self, prefix='lambda_package', venv=None, minify=True,
                            handler_file=None, settings_file='zappa_settings.json', exclude=None):
         """
         Creates the handler zip for lambda. Only the handler and files necessary to pull the project from S3 are in
         this zip. The file path is returned.
         """
-        import pip
 
         if not venv:
             if 'VIRTUAL_ENV' in os.environ:
@@ -368,14 +379,8 @@ class Zappa(object):
             filename = handler_file.split(os.sep)[-1]
             shutil.copy(handler_file, os.path.join(temp_handler_path, filename))
 
-        # Find zappa's dependencies
-        # TODO make this recursive for each of the dependencies
-        deps = []
-        for package in pip.get_installed_distributions():
-            if package.project_name == 'zappa':
-                deps.append('zappa')
-                for requirement_package in package.requires():
-                    deps.append(requirement_package.project_name.lower())
+        # Just get zappa's dependencies
+        deps = self.get_deps_list('zappa')
 
         # Pull in zappa and the dependencies
         for dep in deps:
