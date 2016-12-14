@@ -418,7 +418,7 @@ to change Zappa's behavior. Use these at your own risk!
         "lambda_handler": "your_custom_handler", // The name of Lambda handler. Default: handler.lambda_handler
         "lets_encrypt_key": "s3://your-bucket/account.key", // Let's Encrypt account key path. Can either be an S3 path or a local file path.
         "lets_encrypt_schedule": "rate(15 days)" // How often to auto-renew Let's Encrypt certificate on the server. Must be set to enable autorenewing, rate or cron syntax.
-        "log_level": "DEBUG", // Set the Zappa log level. Default INFO, can be one of CRITICAL, ERROR, WARNING, INFO and DEBUG.
+        "log_level": "DEBUG", // Set the Zappa log level. Can be one of CRITICAL, ERROR, WARNING, INFO and DEBUG. Default: DEBUG
         "manage_roles": true, // Have Zappa automatically create and define IAM execution roles and policies. Default true. If false, you must define your own IAM Role and role_name setting.
         "memory_size": 512, // Lambda function memory in MB
         "method_header_types": [ // Which headers to include in the API response. Defaults:
@@ -677,6 +677,7 @@ To learn more about these capabilities, see [these slides](https://htmlpreview.g
 * [Using Django-Zappa, Part 2: VPCs](https://serverlesscode.com/post/zappa-wsgi-for-python-pt-2/).
 * [Building Serverless Microservices with Zappa and Flask](https://gun.io/blog/serverless-microservices-with-zappa-and-flask/)
 * [Zappa で Hello World するまで (Japanese)](http://qiita.com/satoshi_iwashita/items/505492193317819772c7)
+* [How to Deploy Zappa with CloudFront, RDS and VPC](https://jinwright.net/how-deploy-serverless-wsgi-app-using-zappa/)
 * _Your guide here?_
 
 ## Zappa in the Press
@@ -697,6 +698,7 @@ To learn more about these capabilities, see [these slides](https://htmlpreview.g
 * [JankyGlance](https://github.com/Miserlou/JankyGlance) - A server-less Yahoo! Pipes replacement.
 * [LambdaMailer](https://github.com/tryolabs/lambda-mailer) - A server-less endpoint for processing a contact form.
 * [Voter Registration Microservice](https://topics.arlingtonva.us/2016/11/voter-registration-search-microservice/) - Official backup to to the Virginia Department of Elections portal.
+* [FreePoll Online](https://www.freepoll.online) - A simple and awesome say for groups to make decisions.
 * And many more!
 
 Are you using Zappa? Let us know and we'll list your site here!
@@ -708,6 +710,7 @@ Are you using Zappa? Let us know and we'll list your site here!
 * [flask-ask](https://github.com/johnwheeler/flask-ask) - A framework for building Amazon Alexa applications. Uses Zappa for deployments.
 * [zappa-file-widget](https://github.com/anush0247/zappa-file-widget) - A Django plugin for supporting binary file uploads in Django on Zappa.
 * [zops](https://github.com/bjinwright/zops) - Utilities for teams and continuous integrations using Zappa.
+* [cookiecutter-mobile-backend](https://github.com/narfman0/cookiecutter-mobile-backend/) - A `cookiecutter` Django project with Zappa and S3 uploads support. 
 
 ## Hacks
 
