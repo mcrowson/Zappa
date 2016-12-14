@@ -30,11 +30,15 @@
     - [Django Management Commands](#django-management-commands)
     - [Let's Encrypt SSL Domain Certification and Installation](#lets-encrypt-ssl-domain-certification-and-installation)
 - [Advanced Settings](#advanced-settings)
+    - [YAML Settings](#yaml-settings)
 - [Advanced Usage](#advanced-usage)
     - [Keeping The Server Warm](#keeping-the-server-warm)
     - [Serving Static Files / Binary Uploads](#serving-static-files--binary-uploads)
     - [Enabling CORS](#enabling-cors)
     - [Enabling Secure Endpoints on API Gateway](#enabling-secure-endpoints-on-api-gateway)
+      - [API Key](#api-key)
+      - [IAM Policy](#iam-policy)
+      - [Authorizer](#authorizer)
     - [Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-dns-auth)
     - [Deploying to a Domain With a Let's Encrypt Certificate (HTTP Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-http-auth)
     - [Setting Environment Variables](#setting-environment-variables)
@@ -43,6 +47,7 @@
     - [Setting Integration Content-Type Aliases](#setting-integration-content-type-aliases)
     - [Catching Unhandled Exceptions](#catching-unhandled-exceptions)
     - [Using Custom AWS IAM Roles and Policies](#using-custom-aws-iam-roles-and-policies)
+    - [Globally Available Server-less Architectures](#globally-available-server-less-architectures)
 - [Zappa Guides](#zappa-guides)
 - [Zappa in the Press](#zappa-in-the-press)
 - [Sites Using Zappa](#sites-using-zappa)
@@ -50,6 +55,7 @@
 - [Hacks](#hacks)
 - [Contributing](#contributing)
     - [Using a Local Repo](#using-a-local-repo)
+- [Support / Development / Training / Consulting](#support--development--training--consulting)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -76,7 +82,7 @@ and now you're server-less! _Wow!_
 
 > What do you mean "serverless"?
 
-Okay, so there still is a server - but it only has a _40 millisecond_ life cycle! Serverless in this case means **"without any permanent infrastucture."**
+Okay, so there still is a server - but it only has a _40 millisecond_ life cycle! Serverless in this case means **"without any permanent infrastructure."**
 
 With a traditional HTTP server, the server is online 24/7, processing requests one by one as they come in. If the queue of incoming requests grows too large, some requests will time out. With Zappa, **each request is given its own virtual HTTP "server"** by Amazon API Gateway. AWS handles the horizontal scaling automatically, so no requests ever time out. Each request then calls your application from a memory cache in AWS Lambda and returns the response via Python's WSGI interface. After your app returns, the "server" dies.
 
@@ -84,7 +90,7 @@ Better still, with Zappa you only pay for the milliseconds of server time that y
 
 It's great for deploying serverless microservices with frameworks like Flask and Bottle, and for hosting larger web apps and CMSes with Django. Or, you can use any WSGI-compatible app you like! You **probably don't need to change your existing applications** to use it, and you're not locked into using it.
 
-And finally, Zappa is **super easy to use**. You can deploy your application with a single command out of the box.  
+And finally, Zappa is **super easy to use**. You can deploy your application with a single command out of the box.
 
 __Awesome!__
 
@@ -100,7 +106,7 @@ _Before you begin, make sure you have a valid AWS account and your [AWS credenti
 
     $ pip install zappa
 
-Please note that Zappa _**must**_ be installed into your project's [virtual environment](http://docs.python-guide.org/en/latest/dev/virtualenvs/). 
+Please note that Zappa _**must**_ be installed into your project's [virtual environment](http://docs.python-guide.org/en/latest/dev/virtualenvs/).
 
 _(If you use [pyenv](https://github.com/yyuu/pyenv) and love to manage virtualenvs with **pyenv-virtualenv**, you just have to call `pyenv local [your_venv_name]` and it's ready. [Conda](http://conda.pydata.org/docs/) users should comment [here](https://github.com/Miserlou/Zappa/pull/108).)_
 
@@ -112,7 +118,7 @@ Next, you'll need to define your local and server-side settings.
 
     $ zappa init
 
-This will automatically detect your application type (Flask, Django, etc.) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
+This will automatically detect your application type (Flask/Django - Pyramid users [see here](https://github.com/Miserlou/Zappa/issues/278#issuecomment-241917956)) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
 
 ```javascript
 {
@@ -205,7 +211,7 @@ See the [example](example/) for more details.
 
 Similarly, you can have your functions execute in response to events that happen in the AWS ecosystem, such as S3 uploads, DynamoDB entries, Kinesis streams, and SNS messages.
 
-In your *zappa_settings.json* file, define your [event sources](http://docs.aws.amazon.com/lambda/latest/dg/invoking-lambda-function.html) and the function you wish to execute. For instance, this will execute `your_module.your_function` in response to new objects in your `my-bucket` S3 bucket. Note that `your_function` must accept `event` and `context` paramaters.
+In your *zappa_settings.json* file, define your [event sources](http://docs.aws.amazon.com/lambda/latest/dg/invoking-lambda-function.html) and the function you wish to execute. For instance, this will execute `your_module.your_function` in response to new objects in your `my-bucket` S3 bucket. Note that `your_function` must accept `event` and `context` parameters.
 
 ```javascript
 {
@@ -216,7 +222,7 @@ In your *zappa_settings.json* file, define your [event sources](http://docs.aws.
             "event_source": {
                   "arn":  "arn:aws:s3:::my-bucket",
                   "events": [
-                    "s3:ObjectCreated:*"
+                    "s3:ObjectCreated:*" // Supported event types: http://docs.aws.amazon.com/AmazonS3/latest/dev/NotificationHowTo.html#supported-notification-event-types
                   ]
                }
             }],
@@ -230,6 +236,40 @@ And then:
     $ zappa schedule production
 
 And now your function will execute every time a new upload appears in your bucket!
+
+Similarly, for a [Simple Notification Service](https://aws.amazon.com/sns/) event:
+
+```javascript
+        "events": [
+            {
+                "function": "your_module.your_function",
+                "event_source": {
+                    "arn":  "arn:aws:sns:::your-event-topic-arn",
+                    "events": [
+                        "sns:Publish"
+                    ]
+                }
+            }
+        ]
+```
+
+[DynamoDB](http://docs.aws.amazon.com/lambda/latest/dg/with-ddb.html) and [Kinesis](http://docs.aws.amazon.com/lambda/latest/dg/with-kinesis.html) are slightly different as it is not event based but pulling from a stream:
+
+```javascript
+       "events": [
+           {
+               "function": "replication.replicate_records",
+               "event_source": {
+                    "arn":  "arn:aws:dynamodb:us-east-1:1234554:table/YourTable/stream/2016-05-11T00:00:00.000",
+                    "starting_position": "TRIM_HORIZON", // Supported values: TRIM_HORIZON, LATEST
+                    "batch_size": 50, // Max: 1000
+                    "enabled": true // Default is false
+               }
+           }
+       ]
+```
+
+You can find more [example event sources here](http://docs.aws.amazon.com/lambda/latest/dg/eventsources.html).
 
 #### Undeploy
 
@@ -256,6 +296,14 @@ You can watch the logs of a deployment by calling the `tail` management command.
 
     $ zappa tail production
 
+By default, this will show all log items. In addition to HTTP and other events, anything `print`ed to `stdout` or `stderr` will be shown in the logs.
+
+You can use the argument `--http` to filter for HTTP requests, which will be in the Apache Common Log Format.
+
+    $ zappa tail production --http
+
+If you don't like the default log colors, you can turn them off with `--no-color`.
+
 #### Remote Function Invocation
 
 You can execute any function in your application directly at any time by using the `invoke` command.
@@ -266,13 +314,25 @@ For instance, suppose you have a basic application in a file called "my_app.py",
 
 Any remote print statements made and the value the function returned will then be printed to your local console. **Nifty!**
 
+You can also invoke interpretable Python 2.7 strings directly by using `--raw`, like so:
+
+    $ zappa invoke production "print 1 + 2 + 3" --raw
+
 #### Django Management Commands
 
 As a convenience, Zappa can also invoke remote Django 'manage.py' commands with the `manage` command. For instance, to perform the basic Django status check:
 
-    $ zappa manage production check
+    $ zappa manage production showmigrations admin
 
-Obviously, this only works for Django projects which have their settings properly defined. _(Please note that commands which take over 30 seconds to execute may time-out. See [this related issue](https://github.com/Miserlou/Zappa/issues/205#issuecomment-236391248) for a work-around.)_ 
+Obviously, this only works for Django projects which have their settings properly defined.
+
+For commands which have their own arguments, you can also pass the command in as a string, like so:
+
+    $ zappa manage production "shell --version"
+
+Commands which require direct user input, such as `createsuperuser`, should be [replaced by commands](http://stackoverflow.com/a/26091252) which use `zappa <env> invoke --raw`.
+
+_(Please note that commands which take over 30 seconds to execute may time-out. See [this related issue](https://github.com/Miserlou/Zappa/issues/205#issuecomment-236391248) for a work-around.)_
 
 #### Let's Encrypt SSL Domain Certification and Installation
 
@@ -282,7 +342,7 @@ If your domain is located within an AWS Route 53 Hosted Zone and you've defined 
 
     $ zappa certify production
 
-And your domain will be verified, certified and registered! 
+And your domain will be verified, certified and registered!
 
 _(Please note that this can take around 45 minutes to take effect the first time your run the command, and around 60 seconds every time after that.)_
 
@@ -297,26 +357,28 @@ to change Zappa's behavior. Use these at your own risk!
  {
     "dev": {
         "api_key_required": false, // enable securing API Gateway endpoints with x-api-key header (default False)
-        "api_key": "your_api_key_id" // optional, use an existing API key. The option "api_key_required" must be true to apply
+        "api_key": "your_api_key_id", // optional, use an existing API key. The option "api_key_required" must be true to apply
+        "apigateway_enabled": true, // Set to false if you don't want to create an API Gateway resource. Default true.
         "assume_policy": "my_assume_policy.json", // optional, IAM assume policy JSON file
         "attach_policy": "my_attach_policy.json", // optional, IAM attach policy JSON file
-        "aws_region": "us-east-1", // AWS Region (default US East),
+        "aws_region": "aws-region-name", // optional, uses region set in profile or environment variables if not set here,
         "callbacks": { // Call custom functions during the local Zappa deployment/update process
             "settings": "my_app.settings_callback", // After loading the settings
             "zip": "my_app.zip_callback", // After creating the package
-            "post": "my_app.post_callback", // After command has excuted
+            "post": "my_app.post_callback", // After command has executed
         },
         "cache_cluster_enabled": false, // Use APIGW cache cluster (default False)
-        "cache_cluster_size": .5, // APIGW Cache Cluster size (default 0.5)
+        "cache_cluster_size": 0.5, // APIGW Cache Cluster size (default 0.5)
         "cloudwatch_log_level": "OFF", // Enables/configures a level of logging for the given staging. Available options: "OFF", "INFO", "ERROR", default "OFF".
         "cloudwatch_data_trace": false, // Logs all data about received events.
         "cloudwatch_metrics_enabled": false, // Additional metrics for the API Gateway.
+        "cors": true, // Enable Cross-Origin Resource Sharing. Default false. If true, simulates the "Enable CORS" button on the API Gateway console. Can also be a dictionary specifying lists of "allowed_headers", "allowed_methods", and string of "allowed_origin"
         "debug": true, // Print Zappa configuration errors tracebacks in the 500
         "delete_local_zip": true, // Delete the local zip archive after code updates
-        "delete_s3_zip": true, // Delete the s3 zip archive after the code updates
+        "delete_s3_zip": true, // Delete the s3 zip archive
         "django_settings": "your_project.production_settings", // The modular path to your Django project's settings. For Django projects only.
         "domain": "yourapp.yourdomain.com", // Required if you're using a domain
-        "environment_variables": {"your_key": "your_value"}, // A dictionary of environment variables that will be available to your deployed app. See also "remote_env_file". Default {}.
+        "environment_variables": {"your_key": "your_value"}, // A dictionary of environment variables that will be available to your deployed app. See also "remote_env". Default {}.
         "events": [
             {   // Recurring events
                 "function": "your_module.your_recurring_function", // The function to execute
@@ -324,7 +386,7 @@ to change Zappa's behavior. Use these at your own risk!
             },
             {   // AWS Reactive events
                 "function": "your_module.your_reactive_function", // The function to execute
-                "event_source": { 
+                "event_source": {
                     "arn":  "arn:aws:s3:::my-bucket", // The ARN of this event source
                     "events": [
                         "s3:ObjectCreated:*" // The specific event to execute in response to.
@@ -333,24 +395,33 @@ to change Zappa's behavior. Use these at your own risk!
             }
         ],
         "exception_handler": "your_module.report_exception", // function that will be invoked in case Zappa sees an unhandled exception raised from your code
-        "exclude": ["*.gz", "*.rar"], // A list of regex patterns to exclude from the archive
+        "exclude": ["*.gz", "*.rar"], // A list of regex patterns to exclude from the archive. To exclude boto3 and botocore (available in an older version on Lambda), add "boto3*" and "botocore*".
+        "extends": "stage_name", // Duplicate and extend another stage's settings. For example, `dev-asia` could extend from `dev-common` with a different `s3_bucket` value.
         "http_methods": ["GET", "POST"], // HTTP Methods to route,
+        "iam_authorization": true, // optional, use IAM to require request signing. Default false. Note that enabling this will override the authorizer configuration.
+        "authorizer": {
+            "function": "your_module.your_auth_function", // Local function to run for token validation. For more information about the function see below.
+            "arn": "arn:aws:lambda:<region>:<account_id>:function:<function_name>", // Existing Lambda function to run for token validation.
+            "result_ttl": 300, // Optional. Default 300. The time-to-live (TTL) period, in seconds, that specifies how long API Gateway caches authorizer results. Currently, the maximum TTL value is 3600 seconds.
+            "token_source": "Authorization", // Optional. Default 'Authorization'. The name of a custom authorization header containing the token that clients submit as part of their requests.
+            "validation_expression": "^Bearer \\w+$", // Optional. A validation expression for the incoming token, specify a regular expression.
+        },
         "integration_response_codes": [200, 301, 404, 500], // Integration response status codes to route
         "integration_content_type_aliases": { // For routing requests with non-standard mime types
             "application/json": [
                 "application/vnd.webhooks+json"
             ]
-        }, 
+        },
         "keep_warm": true, // Create CloudWatch events to keep the server warm.
         "keep_warm_expression": "rate(4 minutes)", // How often to execute the keep-warm, in cron and rate format. Default 4 minutes.
         "lambda_description": "Your Description", // However you want to describe your project for the AWS console. Default "Zappa Deployment".
         "lambda_handler": "your_custom_handler", // The name of Lambda handler. Default: handler.lambda_handler
         "lets_encrypt_key": "s3://your-bucket/account.key", // Let's Encrypt account key path. Can either be an S3 path or a local file path.
         "lets_encrypt_schedule": "rate(15 days)" // How often to auto-renew Let's Encrypt certificate on the server. Must be set to enable autorenewing, rate or cron syntax.
-        "log_level": "DEBUG", // Set the Zappa log level. Default INFO, can be one of CRITICAL, ERROR, WARNING, INFO and DEBUG.
+        "log_level": "DEBUG", // Set the Zappa log level. Can be one of CRITICAL, ERROR, WARNING, INFO and DEBUG. Default: DEBUG
         "manage_roles": true, // Have Zappa automatically create and define IAM execution roles and policies. Default true. If false, you must define your own IAM Role and role_name setting.
         "memory_size": 512, // Lambda function memory in MB
-        "method_header_types": [ // Which headers to include in the API response. Defaults: 
+        "method_header_types": [ // Which headers to include in the API response. Defaults:
             "Content-Type",
             "Location",
             "Status",
@@ -362,15 +433,13 @@ to change Zappa's behavior. Use these at your own risk!
         "prebuild_script": "your_module.your_function", // Function to execute before uploading code
         "profile_name": "your-profile-name", // AWS profile credentials to use. Default 'default'.
         "project_name": "MyProject", // The name of the project as it appears on AWS. Defaults to a slugified `pwd`.
-        "remote_env_bucket": "my-project-config-files", // optional s3 bucket where remote_env_file can be located.
-        "remote_env_file": "filename.json", // file in remote_env_bucket containing a flat json object which will be used to set custom environment variables.
+        "remote_env": "s3://my-project-config-files/filename.json", // optional file in s3 bucket containing a flat json object which will be used to set custom environment variables.
         "role_name": "MyLambdaRole", // Name of Zappa execution role. Default ZappaExecutionRole. To use a different, pre-existing policy, you must also set manage_roles to false.
         "s3_bucket": "dev-bucket", // Zappa zip bucket,
         "settings_file": "~/Projects/MyApp/settings/dev_settings.py", // Server side settings file location,
         "timeout_seconds": 30, // Maximum lifespan for the Lambda function (default 30, max 300.)
         "touch": false, // GET the production URL upon initial deployment (default True)
         "use_precompiled_packages": false, // If possible, use C-extension packages which have been pre-compiled for AWS Lambda
-        "use_apigateway": true, // Set to false if you don't want to create API Gateway resource. Default true
         "vpc_config": { // Optional VPC configuration for Lambda function
             "SubnetIds": [ "subnet-12345678" ], // Note: not all availability zones support Lambda!
             "SecurityGroupIds": [ "sg-12345678" ]
@@ -379,11 +448,42 @@ to change Zappa's behavior. Use these at your own risk!
 }
 ```
 
+#### YAML Settings
+
+If you prefer YAML over JSON, you can also use a `zappa_settings.yml`, like so:
+
+```yaml
+---
+dev:
+  app_function: your_module.your_app
+  s3_bucket: your-code-bucket
+  events:
+  - function: your_module.your_function
+    event_source:
+      arn: arn:aws:s3:::your-event-bucket
+      events:
+      - s3:ObjectCreated:*
+```
+
+You can also supply a custom settings file at any time with the `-s` argument, ex:
+
+```
+$ zappa deploy dev -s my-custom-settings.yml
+```
+
+Similarly, you can supply a `zappa_settings.toml` file:
+
+```toml
+[dev]
+  app_function = "your_module.your_app"
+  s3_bucket = "your-code-bucket"
+```
+
 ## Advanced Usage
 
 #### Keeping The Server Warm
 
-Zappa will automatically set up a regularly occuring execution of your application in order to keep the Lambda function warm. This can be disabled via the 'keep_warm' setting.
+Zappa will automatically set up a regularly occurring execution of your application in order to keep the Lambda function warm. This can be disabled via the 'keep_warm' setting.
 
 #### Serving Static Files / Binary Uploads
 
@@ -395,11 +495,31 @@ Similarly, you will not be able to accept binary multi-part uploads through the 
 
 #### Enabling CORS
 
-To enable Cross-Origin Resource Sharing (CORS) for your application, follow the [AWS "How to CORS" Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html) to enable CORS via the API Gateway Console. Don't forget to enable CORS per parameter and re-deploy your API after making the changes!
+The easiest way to enable CORS (Cross-Origin Resource Sharing) for in your Zappa application is to set `cors` to `true` in your Zappa settings file and updating, which is the equivalent of pushing the "Enable CORS" button in the AWS API Gateway console. This is disabled by default, but you may wish to enable it for APIs which are accssed from other domains, etc.
+
+You can also simply handle CORS directly in your application. If you do this, you'll need to add `Access-Control-Allow-Origin`, `Access-Control-Allow-Headers`, and `Access-Control-Allow-Methods` to the `method_header_types` key in your `zappa_settings.json`. See further [discussion here](https://github.com/Miserlou/Zappa/issues/41).
 
 #### Enabling Secure Endpoints on API Gateway
 
+##### API Key
+
 You can use the `api_key_required` setting to generate and assign an API key to all the routes of your API Gateway. After redeployment, you can then pass the provided key as a header called `x-api-key` to access the restricted endpoints. Without the `x-api-key` header, you will receive a 403. [More information on API keys in the API Gateway](http://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-api-keys.html)
+
+##### IAM Policy
+
+You can enable IAM-based (v4 signing) authorization on an API by setting the `iam_authorization` setting to `true`. Your API will then require signed requests and access can be controlled via [IAM policy](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-iam-policy-examples.html). Unsigned requests will receive a 403 response, as will requesters who are not authorized to access the API. Enabling this will override the Authorizer configuration (see below).
+
+##### Authorizer
+If you deploy an API endpoint with Zappa, you can take advantage of [API Gateway Authorizers](http://docs.aws.amazon.com/apigateway/latest/developerguide/use-custom-authorizer.html) to implement a token-based authentication - all you need to do is to provide a function to create the required output, Zappa takes care of the rest. A good start for the function is the [awslabs blueprint example.](https://github.com/awslabs/aws-apigateway-lambda-authorizer-blueprints/blob/master/blueprints/python/api-gateway-authorizer-python.py)
+
+If you are wondering for what you would use an Authorizer, here are some potential use cases:
+
+1. Call out to OAuth provider
+2. Decode a JWT token inline
+3. Lookup in a self-managed DB (for example DynamoDB)
+
+Zappa can be configured to call a function inside your code to do the authorization, or to call some other existing lambda function (which lets you share the authorizer between multiple lambdas). You control the behavior by specifying either the `arn` or `function_name` values in the `authorizer` settings block.
+
 
 #### Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)
 
@@ -438,11 +558,13 @@ your_value = os.environ.get('your_key')
 
 If your project needs to be aware of the type of environment you're deployed to, you'll also be able to get `SERVERTYPE` (AWS Lambda), `FRAMEWORK` (Zappa), `PROJECT` (your project name) and `STAGE` (_dev_, _production_, etc.) variables at any time.
 
+Please note that these are not the [AWS Lambda environment variables](https://github.com/Miserlou/Zappa/issues/501) that Amazon now offers directly. These were implemented long before that feature was available, and will not be available through your AWS console.
+
 ##### Remote Environment Variables
 
-If you want to use remote environment variables to configure your application (which is especially useful for things like sensitive credentials), you can create a file and place it in an S3 bucket to which your Zappa application has access to. To do this, add the `remote_env_bucket` and `remote_env_file` keys to zappa_settings pointing to a file containing a flat JSON object, so that each key-value pair on the object will be set as an environment variable and value whenever a new lambda instance spins up.
+If you want to use remote environment variables to configure your application (which is especially useful for things like sensitive credentials), you can create a file and place it in an S3 bucket to which your Zappa application has access to. To do this, add the `remote_env` key to zappa_settings pointing to a file containing a flat JSON object, so that each key-value pair on the object will be set as an environment variable and value whenever a new lambda instance spins up.
 
-For example, to ensure your application has access to the database credentials without storing them in your version control, you can add a file to S3 with the connection string and load it into the lambda environment using the `remote_env_bucket` and `remote_env_file` configuration settings.
+For example, to ensure your application has access to the database credentials without storing them in your version control, you can add a file to S3 with the connection string and load it into the lambda environment using the `remote_env` configuration setting.
 
 super-secret-config.json (uploaded to my-config-bucket):
 ```javascript
@@ -456,8 +578,7 @@ zappa_settings.json:
 {
     "dev": {
         ...
-        "remote_env_bucket": "my-config-bucket",
-        "remote_env_file": "super-secret-config.json"
+        "remote_env": "s3://my-config-bucket/super-secret-config.json",
     },
     ...
 }
@@ -466,7 +587,7 @@ zappa_settings.json:
 Now in your application you can use:
 ```python
 import os
-db_string = os.environ('DB_CONNECTION_STRING')
+db_string = os.environ.get('DB_CONNECTION_STRING')
 ```
 
 #### Setting Integration Content-Type Aliases
@@ -517,7 +638,7 @@ By default, AWS Lambda will attempt to retry an event based (non-API Gateway, e.
 
 #### Using Custom AWS IAM Roles and Policies
 
-By default, the Zappa client will create and manage the necessary IAM policies and roles to deploy and execute Zappa applications. However, if you're using Zappa in a corporate environment or as part of a continuous integration, you may instead want to manually manage your policies instead. 
+By default, the Zappa client will create and manage the necessary IAM policies and roles to execute Zappa applications. However, if you're using Zappa in a corporate environment or as part of a continuous integration, you may instead want to manually manage your remote execution policies instead. (You can specify which _local_ profile to use for deploying your Zappa application by defining the `profile_name` setting, which will correspond to a profile in your AWS credentials file.)
 
 To manually define the permissions policy of your Zappa execution role, you must define the following in your *zappa_settings.json*:
 
@@ -535,6 +656,20 @@ To manually define the permissions policy of your Zappa execution role, you must
 
 Ongoing discussion about the minimum policy requirements necessary for a Zappa deployment [can be found here](https://github.com/Miserlou/Zappa/issues/244).
 
+#### Globally Available Server-less Architectures
+
+
+<p align="center">
+  <a href="https://htmlpreview.github.io/?https://github.com/Miserlou/Talks/blob/master/serverless-london/global.html#0"><img src="http://i.imgur.com/oR61Qau.png" alt="Global Zappa Slides"/></a>
+</p>
+<p align="center">
+  <i>Click to see <a href="https://htmlpreview.github.io/?https://github.com/Miserlou/Talks/blob/master/serverless-london/global.html#0">slides from ServerlessConf London</a>!</i>
+</p>
+
+During the `init` process, you will be given the option to deploy your application "globally." This will allow you to deploy your application to all available AWS regions simultaneously in order to provide a consistent global speed, increased redundancy, data isolation, and legal compliance. You can also choose to deploy only to "primary" locations, the AWS regions with `-1` in their names.
+
+To learn more about these capabilities, see [these slides](https://htmlpreview.github.io/?https://github.com/Miserlou/Talks/blob/master/serverless-london/global.html#0) from ServerlessConf London.
+
 ## Zappa Guides
 
 * [Django-Zappa tutorial screencast](https://www.youtube.com/watch?v=plUrbPN0xc8&feature=youtu.be).
@@ -542,6 +677,7 @@ Ongoing discussion about the minimum policy requirements necessary for a Zappa d
 * [Using Django-Zappa, Part 2: VPCs](https://serverlesscode.com/post/zappa-wsgi-for-python-pt-2/).
 * [Building Serverless Microservices with Zappa and Flask](https://gun.io/blog/serverless-microservices-with-zappa-and-flask/)
 * [Zappa で Hello World するまで (Japanese)](http://qiita.com/satoshi_iwashita/items/505492193317819772c7)
+* [How to Deploy Zappa with CloudFront, RDS and VPC](https://jinwright.net/how-deploy-serverless-wsgi-app-using-zappa/)
 * _Your guide here?_
 
 ## Zappa in the Press
@@ -553,40 +689,65 @@ Ongoing discussion about the minimum policy requirements necessary for a Zappa d
 ## Sites Using Zappa
 
 * [Zappa.io](https://www.zappa.io) - A simple Zappa homepage
+* [Zappatista!](https://blog.zappa.io) - The official Zappa blog!
 * [Mailchimp Signup Utility](https://github.com/sasha42/Mailchimp-utility) - A microservice for adding people to a mailing list via API.
 * [Zappa Slack Inviter](https://github.com/Miserlou/zappa-slack-inviter) - A tiny, server-less service for inviting new users to your Slack channel.
 * [Serverless Image Host](https://github.com/Miserlou/serverless-imagehost) - A thumbnailing service with Flask, Zappa and Pillow.
 * [Gigger](https://www.gigger.rocks/) - The live music industry's search engine
+* [Zappa BitTorrent Tracker](https://github.com/Miserlou/zappa-bittorrent-tracker) - An experimental server-less BitTorrent tracker. Work in progress.
+* [JankyGlance](https://github.com/Miserlou/JankyGlance) - A server-less Yahoo! Pipes replacement.
+* [LambdaMailer](https://github.com/tryolabs/lambda-mailer) - A server-less endpoint for processing a contact form.
+* [Voter Registration Microservice](https://topics.arlingtonva.us/2016/11/voter-registration-search-microservice/) - Official backup to to the Virginia Department of Elections portal.
+* [FreePoll Online](https://www.freepoll.online) - A simple and awesome say for groups to make decisions.
 * And many more!
 
 Are you using Zappa? Let us know and we'll list your site here!
 
 ## Related Projects
 
-* [lambda-packages](http://github.com/Miserlou/lambda-packages) - Precompiled C-extention packages for AWS Lambda. Used automatically by Zappa.
+* [lambda-packages](http://github.com/Miserlou/lambda-packages) - Precompiled C-extension packages for AWS Lambda. Used automatically by Zappa.
 * [zappa-cms](http://github.com/Miserlou/zappa-cms) - A tiny server-less CMS for busy hackers. Work in progress.
 * [flask-ask](https://github.com/johnwheeler/flask-ask) - A framework for building Amazon Alexa applications. Uses Zappa for deployments.
 * [zappa-file-widget](https://github.com/anush0247/zappa-file-widget) - A Django plugin for supporting binary file uploads in Django on Zappa.
+* [zops](https://github.com/bjinwright/zops) - Utilities for teams and continuous integrations using Zappa.
+* [cookiecutter-mobile-backend](https://github.com/narfman0/cookiecutter-mobile-backend/) - A `cookiecutter` Django project with Zappa and S3 uploads support. 
 
 ## Hacks
 
 Zappa goes quite far beyond what Lambda and API Gateway were ever intended to handle. As a result, there are quite a few hacks in here that allow it to work. Some of those include, but aren't limited to..
 
-* Using VTL to map body, headers, method, params and query strings into JSON, and then turning that into valid WSGI.
-* Attaching response codes to response bodies, Base64 encoding the whole thing, using that as a regex to route the response code, decoding the body in VTL, and mapping the response body to that.
+* ~~~Using VTL to map body, headers, method, params and query strings into JSON, and then turning that into valid WSGI.~~~
+* ~~~Attaching response codes to response bodies, Base64 encoding the whole thing, using that as a regex to route the response code, decoding the body in VTL, and mapping the response body to that.~~~
 * Packing and _Base58_ encoding multiple cookies into a single cookie because we can only map one kind.
-* Turning cookie-setting 301/302 responses into 200 responses with HTML redirects, because we have no way to set headers on redirects.
+* ~~~Turning cookie-setting 301/302 responses into 200 responses with HTML redirects, because we have no way to set headers on redirects.~~~
 
 ## Contributing
 
-This project is still young, so there is still plenty to be done. Contributions are more than welcome! 
+This project is still young, so there is still plenty to be done. Contributions are more than welcome!
 
-Please file tickets for discussion before submitting patches, and submit your patches to the "dev" branch if possible. If dev falls behind master, feel free to rebase.
+Please file tickets for discussion before submitting patches. Pull requests should target `master` and should leave Zappa in a "shippable" state if merged.
 
-If you are adding a non-trivial amount of new code, please include a functioning test in your PR. For AWS calls, we use the placebo library, which you can learn to use [in the test writing guide](docs/README.md).
+If you are adding a non-trivial amount of new code, please include a functioning test in your PR. For AWS calls, we use the placebo library, which you can learn to use [in the test writing guide](docs/README.md). The test suite will be run by [Travis CI](https://travis-ci.org/Miserlou/Zappa) once you open a pull request.
 
-Please also write comments along with your new code, including the URL of the ticket which you filed along with the PR. This greatly helps for project maintainability, as it allows us to trace back use cases and explain decision making.
+Please include the GitHub issue or pull request URL that has discussion related to your changes as a comment in the code ([example](https://github.com/Miserlou/Zappa/blob/fae2925431b820eaedf088a632022e4120a29f89/zappa/zappa.py#L241-L243)]). This greatly helps for project maintainability, as it allows us to trace back use cases and explain decision making.
 
 #### Using a Local Repo
 
-To use the git HEAD, you *can't* use `pip install -e `. Instead, you should clone the repo to your machine and then `pip install /path/to/zappa/repo` or `ln -s /path/to/zappa/repo/zappa zappa` in your local project.
+To use the git HEAD, you *probably can't* use `pip install -e `. Instead, you should clone the repo to your machine and then `pip install /path/to/zappa/repo` or `ln -s /path/to/zappa/repo/zappa zappa` in your local project.
+
+## Support / Development / Training / Consulting
+
+Do you need help with..
+
+  * Porting existing Flask and Django applications to Zappa?
+  * Building new applications and services that scale infinitely?
+  * Reducing your operations and hosting costs?
+  * Adding new custom features into Zappa?
+  * Training your team to use AWS and other server-less paradigms?
+
+Good news! We're currently available for remote and on-site consulting for small, large and enterprise teams. Please contact <miserlou@gmail.com> with your needs and let's work together!
+
+<br />
+<p align="center">
+  <a href="https://gun.io"><img src="http://i.imgur.com/M7wJipR.png" alt="Made by Gun.io"/></a>
+</p>

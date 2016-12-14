@@ -8,8 +8,7 @@ DOMAIN = None
 API_STAGE = 'ttt888'
 PROJECT_NAME = 'ttt888'
 
-REMOTE_ENV_BUCKET='lmbda'
-REMOTE_ENV_FILE='test_env.json'
+REMOTE_ENV='s3://lmbda/test_env.json'
 ## test_env.json
 #{
 #	"hello": "world"
@@ -24,6 +23,8 @@ AWS_EVENT_MAPPING = {
 }
 
 ENVIRONMENT_VARIABLES={'testenv': 'envtest'}
+
+AUTHORIZER_FUNCTION='test_settings.authorizer_event'
 
 
 def prebuild_me():
@@ -49,6 +50,8 @@ def aws_dynamodb_event(event, content):
 def aws_kinesis_event(event, content):
     return "AWS KINESIS EVENT"
 
+def authorizer_event(event, content):
+    return "AUTHORIZER_EVENT"
 
 def command():
     print("command")

@@ -127,6 +127,8 @@ Enabling Secure Endpoints on API Gateway
 
 You can use the ``api_key_required`` setting to generate and assign an API key to all the routes of your API Gateway. After redeployment, you can then pass the provided key as a header called ``x-api-key`` to access the restricted endpoints. Without the ``x-api-key`` header, you will receive a 403. See `more information on API keys in the API Gateway <http://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-api-keys.html>`_. 
 
+You can enable IAM-based (v4 signing) authorization on an API by setting the ``authorization_type`` setting to ``AWS_IAM``. Your API will then require signed requests and access can be controlled via `IAM policy <https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-iam-policy-examples.html>`. Unsigned requests will receive a 403 response, as will requesters who are not authorized to access the API.
+
 Deploying to a Domain With a Let's Encrypt Certificate
 ======================================================
 
@@ -135,9 +137,9 @@ If you want to use Zappa on a domain with a free Let's Encrypt certificate, you 
 Setting Environment Variables
 =============================
 
-If you want to use environment variables to configure your application (which is especially useful for things like sensitive credentials), you can create a file and place it in an S3 bucket to which your Zappa application has access to. To do this, add the ``remote_env_bucket`` and ``remote_env_file`` keys to zappa_settings pointing to a file containing a flat JSON object, so that each key-value pair on the object will be set as an environment variable and value whenever a new lambda instance spins up.
+If you want to use environment variables to configure your application (which is especially useful for things like sensitive credentials), you can create a file and place it in an S3 bucket to which your Zappa application has access to. To do this, add the ``remote_env`` key to zappa_settings pointing to a file containing a flat JSON object, so that each key-value pair on the object will be set as an environment variable and value whenever a new lambda instance spins up.
 
-For example, to ensure your application has access to the database credentials without storing them in your version control, you can add a file to S3 with the connection string and load it into the lambda environment using the ``remote_env_bucket`` and ``remote_env_file`` configuration settings.
+For example, to ensure your application has access to the database credentials without storing them in your version control, you can add a file to S3 with the connection string and load it into the lambda environment using the ``remote_env`` configuration setting.
 
 super-secret-config.json (uploaded to my-config-bucket):
 
@@ -154,8 +156,7 @@ zappa_settings.json:
     {
         "dev": {
             ...
-            "remote_env_bucket": "my-config-bucket",
-            "remote_env_file": "super-secret-config.json"
+            "remote_env": "s3://my-config-bucket/super-secret-config.json",
         },
         ...
     }
@@ -165,4 +166,4 @@ Now in your application you can use:
 ::
 
     import os
-    db_string = os.environ('DB_CONNECTION_STRING')
+    db_string = os.environ.get('DB_CONNECTION_STRING')

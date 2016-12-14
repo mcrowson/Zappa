@@ -2,21 +2,28 @@
 import base64
 import collections
 import json
+from contextlib import nested
+
 import mock
 import os
 import random
 import string
+import zipfile
+import re
 import unittest
 
+from click.exceptions import ClickException
 from lambda_packages import lambda_packages
 
-from .utils import placebo_session
+from .utils import placebo_session, patch_open
 
 from zappa.cli import ZappaCLI, shamelessly_promote
 from zappa.ext.django_zappa import get_django_wsgi
 from zappa.handler import LambdaHandler, lambda_handler
 from zappa.letsencrypt import get_cert_and_update_domain, create_domain_key, create_domain_csr, create_chained_certificate, get_cert, cleanup, parse_account_key, parse_csr, sign_certificate, encode_certificate, register_account, verify_challenge
-from zappa.util import detect_django_settings, copytree, detect_flask_apps, add_event_source, remove_event_source, get_event_source_status
+from zappa.util import (detect_django_settings, copytree, detect_flask_apps,
+                        add_event_source, remove_event_source,
+                        get_event_source_status, parse_s3_url)
 from zappa.wsgi import create_wsgi_request, common_log
 from zappa.zappa import Zappa, ASSUME_POLICY, ATTACH_POLICY
 
@@ -25,6 +32,23 @@ def random_string(length):
 
 
 class TestZappa(unittest.TestCase):
+    def setUp(self):
+        self.sleep_patch = mock.patch('time.sleep', return_value=None)
+        # Tests expect us-east-1.
+        # If the user has set a different region in env variables, we set it aside for now and use us-east-1
+        self.users_current_region_name = os.environ.get('AWS_DEFAULT_REGION', None)
+        os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
+        if not os.environ.get('PLACEBO_MODE') == 'record':
+            self.sleep_patch.start()
+
+    def tearDown(self):
+        if not os.environ.get('PLACEBO_MODE') == 'record':
+            self.sleep_patch.stop()
+        del os.environ['AWS_DEFAULT_REGION']
+        if self.users_current_region_name is not None:
+            # Give the user their AWS region back, we're done testing with us-east-1.
+            os.environ['AWS_DEFAULT_REGION'] = self.users_current_region_name
+
     ##
     # Sanity Tests
     ##
@@ -39,11 +63,61 @@ class TestZappa(unittest.TestCase):
         self.assertTrue(True)
         Zappa()
 
+    @mock.patch('zappa.zappa.find_packages')
+    @mock.patch('os.remove')
+    def test_copy_editable_packages(self, mock_remove, mock_find_packages):
+        temp_package_dir = '/var/folders/rn/9tj3_p0n1ln4q4jn1lgqy4br0000gn/T/1480455339'
+        egg_links = [
+            '/user/test/.virtualenvs/test/lib/python2.7/site-packages/package-python.egg-link'
+        ]
+        egg_path = "/some/other/directory/package"
+        mock_find_packages.return_value = ["package", "package.subpackage", "package.another"]
+        temp_egg_link = os.path.join(temp_package_dir, 'package-python.egg-link')
+
+        z = Zappa()
+        with nested(
+                patch_open(), mock.patch('glob.glob'), mock.patch('zappa.zappa.copytree')
+        ) as ((mock_open, mock_file), mock_glob, mock_copytree):
+            # We read in the contents of the egg-link file
+            mock_file.read.return_value = "{}\n.".format(egg_path)
+
+            # we use glob.glob to get the egg-links in the temp packages directory
+            mock_glob.return_value = [temp_egg_link]
+
+            z.copy_editable_packages(egg_links, temp_package_dir)
+
+            # make sure we copied the right directories
+            mock_copytree.assert_called_with(
+                os.path.join(egg_path, 'package'),
+                os.path.join(temp_package_dir, 'package'),
+                symlinks=False
+            )
+            self.assertEqual(mock_copytree.call_count, 1)
+
+            # make sure it removes the egg-link from the temp packages directory
+            mock_remove.assert_called_with(temp_egg_link)
+            self.assertEqual(mock_remove.call_count, 1)
+
     def test_create_lambda_package(self):
         # mock the pip.get_installed_distributions() to include a package in lambda_packages so that the code
         # for zipping pre-compiled packages gets called
         mock_named_tuple = collections.namedtuple('mock_named_tuple', ['project_name'])
         mock_return_val = [mock_named_tuple(lambda_packages.keys()[0])]  # choose name of 1st package in lambda_packages
+        with mock.patch('pip.get_installed_distributions', return_value=mock_return_val):
+            z = Zappa()
+            path = z.create_lambda_zip(handler_file=os.path.realpath(__file__))
+            self.assertTrue(os.path.isfile(path))
+            os.remove(path)
+
+    def test_get_manylinux(self):
+        z = Zappa()
+        self.assertNotEqual(z.get_manylinux_wheel('pandas'), None)
+        self.assertEqual(z.get_manylinux_wheel('derpderpderpderp'), None)
+
+        # mock the pip.get_installed_distributions() to include a package in manylinux so that the code
+        # for zipping pre-compiled packages gets called
+        mock_named_tuple = collections.namedtuple('mock_named_tuple', ['project_name'])
+        mock_return_val = [mock_named_tuple('pandas')]
         with mock.patch('pip.get_installed_distributions', return_value=mock_return_val):
             z = Zappa()
             path = z.create_lambda_zip(handler_file=os.path.realpath(__file__))
@@ -77,118 +151,101 @@ class TestZappa(unittest.TestCase):
         self.assertEqual(loaded_creds.secret_key, 'JKL456')
         self.assertEqual(z.boto_session.region_name, 'us-west-1')
 
-    @placebo_session
-    def test_upload_remove_s3(self, session):
-        bucket_name = 'test_zappa_upload_s3'
-        z = Zappa(session)
-        zip_path = z.create_lambda_zip(minify=False)
-        res = z.upload_to_s3(zip_path, bucket_name)
-        os.remove(zip_path)
-        self.assertTrue(res)
-        s3 = session.resource('s3')
-
-        # will throw ClientError with 404 if bucket doesn't exist
-        s3.meta.client.head_bucket(Bucket=bucket_name)
-
-        # will throw ClientError with 404 if object doesn't exist
-        s3.meta.client.head_object(
-            Bucket=bucket_name,
-            Key=zip_path,
-        )
-        res = z.remove_from_s3(zip_path, bucket_name)
-        self.assertTrue(res)
-
-        fail = z.upload_to_s3('/tmp/this_isnt_real', bucket_name)
-        self.assertFalse(fail)
-
-    @placebo_session
-    def test_create_lambda_function(self, session):
-        bucket_name = 'lmbda'
-        zip_path = 'Spheres-dev-1454694878.zip'
-
-        z = Zappa(session)
-        z.aws_region = 'us-east-1'
-        z.load_credentials(session)
-        z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
-
-        arn = z.create_lambda_function(
-            bucket=bucket_name,
-            s3_key=zip_path,
-            function_name='test_lmbda_function55',
-            handler='runme.lambda_handler'
-        )
-
-        arn = z.update_lambda_function(
-            bucket=bucket_name,
-            s3_key=zip_path,
-            function_name='test_lmbda_function55',
-        )
-
-    @placebo_session
-    def test_rollback_lambda_function_version(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::724336686645:role/ZappaLambdaExecution'
-
-        function_name = 'django-helloworld-unicode'
-        too_many_versions = z.rollback_lambda_function_version(function_name, 99999)
-        self.assertFalse(too_many_versions)
-
-        function_arn = z.rollback_lambda_function_version(function_name, 1)
-
-    @placebo_session
-    def test_invoke_lambda_function(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::724336686645:role/ZappaLambdaExecution'
-
-        function_name = 'django-helloworld-unicode'
-        payload = '{"event": "hello"}'
-        response = z.invoke_lambda_function(function_name, payload)
-
-    @placebo_session
-    def test_create_iam_roles(self, session):
-        z = Zappa(session)
-        arn, updated = z.create_iam_roles()
-        self.assertEqual(arn, "arn:aws:iam::123:role/{}".format(z.role_name))
-
-    @placebo_session
-    def test_create_api_gateway_routes(self, session):
-        z = Zappa(session)
+    def test_create_api_gateway_routes_with_different_auth_methods(self):
+        z = Zappa()
         z.parameter_depth = 1
         z.integration_response_codes = [200]
         z.method_response_codes = [200]
         z.http_methods = ['GET']
         z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
         lambda_arn = 'arn:aws:lambda:us-east-1:12345:function:helloworld'
-        with mock.patch('time.time', return_value=123.456):
-            api_id = z.create_api_gateway_routes(lambda_arn)
-        self.assertEqual(api_id, 'j27idab94h')
 
-    @placebo_session
-    def test_deploy_api_gateway(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
+        # No auth at all
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, False, None)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("NONE", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("NONE", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual(False, parsable_template["Resources"]["GET0"]["Properties"]["ApiKeyRequired"])
+        self.assertEqual(False, parsable_template["Resources"]["GET1"]["Properties"]["ApiKeyRequired"])
 
-        z.parameter_depth = 1
-        z.integration_response_codes = [200]
-        z.method_response_codes = [200]
-        z.http_methods = ['GET']
+        # IAM auth
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, True, None)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual(False, parsable_template["Resources"]["GET0"]["Properties"]["ApiKeyRequired"])
+        self.assertEqual(False, parsable_template["Resources"]["GET1"]["Properties"]["ApiKeyRequired"])
 
-        lambda_arn = 'arn:aws:lambda:us-east-1:12345:function:django-helloworld-unicode'
-        api_id = z.create_api_gateway_routes(lambda_arn)
-        endpoint_url = z.deploy_api_gateway(api_id, "test_stage")
+        # CORS with auth
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, True, None, True)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual("NONE", parsable_template["Resources"]["OPTIONS0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("NONE", parsable_template["Resources"]["OPTIONS1"]["Properties"]["AuthorizationType"])
+        self.assertEqual("MOCK", parsable_template["Resources"]["OPTIONS0"]["Properties"]["Integration"]["Type"])
+        self.assertEqual("MOCK", parsable_template["Resources"]["OPTIONS1"]["Properties"]["Integration"]["Type"])
+        self.assertEqual("'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+                         parsable_template["Resources"]["OPTIONS0"]["Properties"]["Integration"]["IntegrationResponses"][0]["ResponseParameters"]["method.response.header.Access-Control-Allow-Headers"])
+        self.assertEqual("'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+                         parsable_template["Resources"]["OPTIONS1"]["Properties"]["Integration"]["IntegrationResponses"][0]["ResponseParameters"]["method.response.header.Access-Control-Allow-Headers"])
+        self.assertTrue(parsable_template["Resources"]["OPTIONS0"]["Properties"]["MethodResponses"][0]["ResponseParameters"]["method.response.header.Access-Control-Allow-Headers"])
+        self.assertTrue(parsable_template["Resources"]["OPTIONS1"]["Properties"]["MethodResponses"][0]["ResponseParameters"]["method.response.header.Access-Control-Allow-Headers"])
+        self.assertEqual(False, parsable_template["Resources"]["GET0"]["Properties"]["ApiKeyRequired"])
+        self.assertEqual(False, parsable_template["Resources"]["GET1"]["Properties"]["ApiKeyRequired"])
 
-    @placebo_session
-    def test_get_api_url(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::724336686645:role/ZappaLambdaExecution'
-        url = z.get_api_url('Spheres-demonstration', 'demonstration')
+        # API Key auth
+        z.create_stack_template(lambda_arn, 'helloworld', True, {}, True, None)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual(True, parsable_template["Resources"]["GET0"]["Properties"]["ApiKeyRequired"])
+        self.assertEqual(True, parsable_template["Resources"]["GET1"]["Properties"]["ApiKeyRequired"])
 
-    @placebo_session
-    def test_fetch_logs(self, session):
-        z = Zappa(session)
-        z.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
-        events = z.fetch_logs('Spheres-demonstration')
-        self.assertTrue(events is not None)
+        # Authorizer and IAM
+        authorizer = {
+            "function": "runapi.authorization.gateway_authorizer.evaluate_token",
+            "result_ttl": 300,
+            "token_header": "Authorization",
+            "validation_expression": "xxx"
+        }
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, True, authorizer)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("AWS_IAM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        with self.assertRaises(KeyError):
+            parsable_template["Resources"]["Authorizer"]
+
+        # Authorizer with validation expression
+        invocations_uri = 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/' + lambda_arn + '/invocations'
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, False, authorizer)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("CUSTOM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("CUSTOM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual("TOKEN", parsable_template["Resources"]["Authorizer"]["Properties"]["Type"])
+        self.assertEqual("ZappaAuthorizer", parsable_template["Resources"]["Authorizer"]["Properties"]["Name"])
+        self.assertEqual(300, parsable_template["Resources"]["Authorizer"]["Properties"]["AuthorizerResultTtlInSeconds"])
+        self.assertEqual(invocations_uri, parsable_template["Resources"]["Authorizer"]["Properties"]["AuthorizerUri"])
+        self.assertEqual(z.credentials_arn, parsable_template["Resources"]["Authorizer"]["Properties"]["AuthorizerCredentials"])
+        self.assertEqual("xxx", parsable_template["Resources"]["Authorizer"]["Properties"]["IdentityValidationExpression"])
+
+        # Authorizer without validation expression
+        authorizer.pop('validation_expression', None)
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, False, authorizer)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual("CUSTOM", parsable_template["Resources"]["GET0"]["Properties"]["AuthorizationType"])
+        self.assertEqual("CUSTOM", parsable_template["Resources"]["GET1"]["Properties"]["AuthorizationType"])
+        self.assertEqual("TOKEN", parsable_template["Resources"]["Authorizer"]["Properties"]["Type"])
+        with self.assertRaises(KeyError):
+            parsable_template["Resources"]["Authorizer"]["Properties"]["IdentityValidationExpression"]
+
+        # Authorizer with arn
+        authorizer = {
+            "arn": "arn:aws:lambda:us-east-1:123456789012:function:my-function",
+        }
+        z.create_stack_template(lambda_arn, 'helloworld', False, {}, False, authorizer)
+        parsable_template = json.loads(z.cf_template.to_json())
+        self.assertEqual('arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:my-function/invocations', parsable_template["Resources"]["Authorizer"]["Properties"]["AuthorizerUri"])
 
     def test_policy_json(self):
         # ensure the policy docs are valid JSON
@@ -253,84 +310,148 @@ class TestZappa(unittest.TestCase):
 
     def test_wsgi_event(self):
 
+        ## This is a pre-proxy+ event
+        # event = {
+        #     "body": "",
+        #     "headers": {
+        #         "Via": "1.1 e604e934e9195aaf3e36195adbcb3e18.cloudfront.net (CloudFront)",
+        #         "Accept-Language": "en-US,en;q=0.5",
+        #         "Accept-Encoding": "gzip",
+        #         "CloudFront-Is-SmartTV-Viewer": "false",
+        #         "CloudFront-Forwarded-Proto": "https",
+        #         "X-Forwarded-For": "109.81.209.118, 216.137.58.43",
+        #         "CloudFront-Viewer-Country": "CZ",
+        #         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        #         "X-Forwarded-Proto": "https",
+        #         "X-Amz-Cf-Id": "LZeP_TZxBgkDt56slNUr_H9CHu1Us5cqhmRSswOh1_3dEGpks5uW-g==",
+        #         "CloudFront-Is-Tablet-Viewer": "false",
+        #         "X-Forwarded-Port": "443",
+        #         "CloudFront-Is-Mobile-Viewer": "false",
+        #         "CloudFront-Is-Desktop-Viewer": "true",
+        #         "Content-Type": "application/json"
+        #     },
+        #     "params": {
+        #         "parameter_1": "asdf1",
+        #         "parameter_2": "asdf2",
+        #     },
+        #     "method": "POST",
+        #     "query": {
+        #         "dead": "beef"
+        #     }
+        # }
+
         event = {
-            "body": "",
-            "headers": {
-                "Via": "1.1 e604e934e9195aaf3e36195adbcb3e18.cloudfront.net (CloudFront)",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip",
-                "CloudFront-Is-SmartTV-Viewer": "false",
-                "CloudFront-Forwarded-Proto": "https",
-                "X-Forwarded-For": "109.81.209.118, 216.137.58.43",
-                "CloudFront-Viewer-Country": "CZ",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "X-Forwarded-Proto": "https",
-                "X-Amz-Cf-Id": "LZeP_TZxBgkDt56slNUr_H9CHu1Us5cqhmRSswOh1_3dEGpks5uW-g==",
-                "CloudFront-Is-Tablet-Viewer": "false",
-                "X-Forwarded-Port": "443",
-                "CloudFront-Is-Mobile-Viewer": "false",
-                "CloudFront-Is-Desktop-Viewer": "true",
-                "Content-Type": "application/json"
-            },
-            "params": {
-                "parameter_1": "asdf1",
-                "parameter_2": "asdf2",
-            },
-            "method": "POST",
-            "query": {
-                "dead": "beef"
+            u'body': None,
+            u'resource': u'/',
+            u'requestContext': {
+                u'resourceId': u'6cqjw9qu0b',
+                u'apiId': u'9itr2lba55',
+                u'resourcePath': u'/',
+                u'httpMethod': u'GET',
+                u'requestId': u'c17cb1bf-867c-11e6-b938-ed697406e3b5',
+                u'accountId': u'724336686645',
+                u'identity': {
+                    u'apiKey': None,
+                    u'userArn': None,
+                    u'cognitoAuthenticationType': None,
+                    u'caller': None,
+                    u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:48.0) Gecko/20100101 Firefox/48.0',
+                    u'user': None,
+                    u'cognitoIdentityPoolId': None,
+                    u'cognitoIdentityId': None,
+                    u'cognitoAuthenticationProvider': None,
+                    u'sourceIp': u'50.191.225.98',
+                    u'accountId': None,
+                    },
+                u'stage': u'devorr',
+                },
+            u'queryStringParameters': None,
+            u'httpMethod': u'GET',
+            u'pathParameters': None,
+            u'headers': {
+                u'Via': u'1.1 6801928d54163af944bf854db8d5520e.cloudfront.net (CloudFront)',
+                u'Accept-Language': u'en-US,en;q=0.5',
+                u'Accept-Encoding': u'gzip, deflate, br',
+                u'CloudFront-Is-SmartTV-Viewer': u'false',
+                u'CloudFront-Forwarded-Proto': u'https',
+                u'X-Forwarded-For': u'50.191.225.98, 204.246.168.101',
+                u'CloudFront-Viewer-Country': u'US',
+                u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                u'Upgrade-Insecure-Requests': u'1',
+                u'Host': u'9itr2lba55.execute-api.us-east-1.amazonaws.com',
+                u'X-Forwarded-Proto': u'https',
+                u'X-Amz-Cf-Id': u'qgNdqKT0_3RMttu5KjUdnvHI3OKm1BWF8mGD2lX8_rVrJQhhp-MLDw==',
+                u'CloudFront-Is-Tablet-Viewer': u'false',
+                u'X-Forwarded-Port': u'443',
+                u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:48.0) Gecko/20100101 Firefox/48.0',
+                u'CloudFront-Is-Mobile-Viewer': u'false',
+                u'CloudFront-Is-Desktop-Viewer': u'true',
+                },
+            u'stageVariables': None,
+            u'path': u'/',
             }
-        }
+
         request = create_wsgi_request(event)
 
-    def test_wsgi_path_info(self):
-        # Test no parameters (site.com/)
+
+    # def test_wsgi_path_info(self):
+    #     # Test no parameters (site.com/)
+    #     event = {
+    #         "body": {},
+    #         "headers": {},
+    #         "pathParameters": {},
+    #         "path": u'/',
+    #         "httpMethod": "GET",
+    #         "queryStringParameters": {}
+    #     }
+
+    #     request = create_wsgi_request(event, trailing_slash=True)
+    #     self.assertEqual("/", request['PATH_INFO'])
+
+    #     request = create_wsgi_request(event, trailing_slash=False)
+    #     self.assertEqual("/", request['PATH_INFO'])
+
+    #     # Test parameters (site.com/asdf1/asdf2 or site.com/asdf1/asdf2/)
+    #     event_asdf2 = {u'body': None, u'resource': u'/{proxy+}', u'requestContext': {u'resourceId': u'dg451y', u'apiId': u'79gqbxq31c', u'resourcePath': u'/{proxy+}', u'httpMethod': u'GET', u'requestId': u'766df67f-8991-11e6-b2c4-d120fedb94e5', u'accountId': u'724336686645', u'identity': {u'apiKey': None, u'userArn': None, u'cognitoAuthenticationType': None, u'caller': None, u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'user': None, u'cognitoIdentityPoolId': None, u'cognitoIdentityId': None, u'cognitoAuthenticationProvider': None, u'sourceIp': u'96.90.37.59', u'accountId': None}, u'stage': u'devorr'}, u'queryStringParameters': None, u'httpMethod': u'GET', u'pathParameters': {u'proxy': u'asdf1/asdf2'}, u'headers': {u'Via': u'1.1 b2aeb492548a8a2d4036401355f928dd.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'X-Forwarded-Port': u'443', u'X-Forwarded-For': u'96.90.37.59, 54.240.144.50', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'Upgrade-Insecure-Requests': u'1', u'Host': u'79gqbxq31c.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'X-Amz-Cf-Id': u'BBFP-RhGDrQGOzoCqjnfB2I_YzWt_dac9S5vBcSAEaoM4NfYhAQy7Q==', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'CloudFront-Forwarded-Proto': u'https'}, u'stageVariables': None, u'path': u'/asdf1/asdf2'}
+    #     event_asdf2_slash = {u'body': None, u'resource': u'/{proxy+}', u'requestContext': {u'resourceId': u'dg451y', u'apiId': u'79gqbxq31c', u'resourcePath': u'/{proxy+}', u'httpMethod': u'GET', u'requestId': u'd6fda925-8991-11e6-8bd8-b5ec6db19d57', u'accountId': u'724336686645', u'identity': {u'apiKey': None, u'userArn': None, u'cognitoAuthenticationType': None, u'caller': None, u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'user': None, u'cognitoIdentityPoolId': None, u'cognitoIdentityId': None, u'cognitoAuthenticationProvider': None, u'sourceIp': u'96.90.37.59', u'accountId': None}, u'stage': u'devorr'}, u'queryStringParameters': None, u'httpMethod': u'GET', u'pathParameters': {u'proxy': u'asdf1/asdf2'}, u'headers': {u'Via': u'1.1 c70173a50d0076c99b5e680eb32d40bb.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'X-Forwarded-Port': u'443', u'X-Forwarded-For': u'96.90.37.59, 54.240.144.53', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'Upgrade-Insecure-Requests': u'1', u'Host': u'79gqbxq31c.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'Cookie': u'zappa=AQ4', u'X-Amz-Cf-Id': u'aU_i-iuT3llVUfXv2zv6uU-m77Oga7ANhd5ZYrCoqXBy4K7I2x3FZQ==', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'CloudFront-Forwarded-Proto': u'https'}, u'stageVariables': None, u'path': u'/asdf1/asdf2/'}
+
+    #     request = create_wsgi_request(event, trailing_slash=True)
+    #     self.assertEqual("/asdf1/asdf2/", request['PATH_INFO'])
+
+    #     request = create_wsgi_request(event, trailing_slash=False)
+    #     self.assertEqual("/asdf1/asdf2", request['PATH_INFO'])
+
+    #     request = create_wsgi_request(event, trailing_slash=False, script_name='asdf1')
+    #     self.assertEqual("/asdf1/asdf2", request['PATH_INFO'])
+
+    def test_wsgi_path_info_unquoted(self):
         event = {
-            "body": {},
-            "headers": {},
-            "params": {},
-            "method": "GET",
-            "query": {}
-        }
-
+                "body": {},
+                "headers": {},
+                "pathParameters": {},
+                "path": '/path%3A1', # encoded /path:1
+                "httpMethod": "GET",
+                "queryStringParameters": {},
+                "requestContext": {}
+            }
         request = create_wsgi_request(event, trailing_slash=True)
-        self.assertEqual("/", request['PATH_INFO'])
+        self.assertEqual("/path:1", request['PATH_INFO'])
 
-        request = create_wsgi_request(event, trailing_slash=False)
-        self.assertEqual("/", request['PATH_INFO'])
-
-        # Test parameters (site.com/asdf1/asdf2 or site.com/asdf1/asdf2/)
-        event = {
-            "body": {},
-            "headers": {},
-            "params": {
-                "parameter_1": "asdf1",
-                "parameter_2": "asdf2",
-            },
-            "method": "GET",
-            "query": {}
-        }
-
-        request = create_wsgi_request(event, trailing_slash=True)
-        self.assertEqual("/asdf1/asdf2/", request['PATH_INFO'])
-
-        request = create_wsgi_request(event, trailing_slash=False)
-        self.assertEqual("/asdf1/asdf2", request['PATH_INFO'])
-
-        request = create_wsgi_request(event, trailing_slash=False, script_name='asdf1')
-        self.assertEqual("/asdf1/asdf2", request['PATH_INFO'])
 
     def test_wsgi_logging(self):
-        event = {
-            "body": {},
-            "headers": {},
-            "params": {
-                "parameter_1": "asdf1",
-                "parameter_2": "asdf2",
-            },
-            "method": "GET",
-            "query": {}
-        }
+        # event = {
+        #     "body": {},
+        #     "headers": {},
+        #     "params": {
+        #         "parameter_1": "asdf1",
+        #         "parameter_2": "asdf2",
+        #     },
+        #     "httpMethod": "GET",
+        #     "query": {}
+        # }
+
+        event = {u'body': None, u'resource': u'/{proxy+}', u'requestContext': {u'resourceId': u'dg451y', u'apiId': u'79gqbxq31c', u'resourcePath': u'/{proxy+}', u'httpMethod': u'GET', u'requestId': u'766df67f-8991-11e6-b2c4-d120fedb94e5', u'accountId': u'724336686645', u'identity': {u'apiKey': None, u'userArn': None, u'cognitoAuthenticationType': None, u'caller': None, u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'user': None, u'cognitoIdentityPoolId': None, u'cognitoIdentityId': None, u'cognitoAuthenticationProvider': None, u'sourceIp': u'96.90.37.59', u'accountId': None}, u'stage': u'devorr'}, u'queryStringParameters': None, u'httpMethod': u'GET', u'pathParameters': {u'proxy': u'asdf1/asdf2'}, u'headers': {u'Via': u'1.1 b2aeb492548a8a2d4036401355f928dd.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'X-Forwarded-Port': u'443', u'X-Forwarded-For': u'96.90.37.59, 54.240.144.50', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'Upgrade-Insecure-Requests': u'1', u'Host': u'79gqbxq31c.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'X-Amz-Cf-Id': u'BBFP-RhGDrQGOzoCqjnfB2I_YzWt_dac9S5vBcSAEaoM4NfYhAQy7Q==', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:49.0) Gecko/20100101 Firefox/49.0', u'CloudFront-Forwarded-Proto': u'https'}, u'stageVariables': None, u'path': u'/asdf1/asdf2'}
+
         environ = create_wsgi_request(event, trailing_slash=False)
         response_tuple = collections.namedtuple('Response', ['status_code', 'content'])
         response = response_tuple(200, 'hello')
@@ -338,7 +459,80 @@ class TestZappa(unittest.TestCase):
         le = common_log(environ, response, response_time=False)
 
     def test_wsgi_multipart(self):
-        event = {u'body': u'LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS03Njk1MjI4NDg0Njc4MTc2NTgwNjMwOTYxDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9Im15c3RyaW5nIg0KDQpkZGQNCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tNzY5NTIyODQ4NDY3ODE3NjU4MDYzMDk2MS0tDQo=', u'headers': {u'Content-Type': u'multipart/form-data; boundary=---------------------------7695228484678176580630961', u'Via': u'1.1 38205a04d96d60185e88658d3185ccee.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'CloudFront-Is-SmartTV-Viewer': u'false', u'CloudFront-Forwarded-Proto': u'https', u'X-Forwarded-For': u'71.231.27.57, 104.246.180.51', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:45.0) Gecko/20100101 Firefox/45.0', u'Host': u'xo2z7zafjh.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'Cookie': u'zappa=AQ4', u'CloudFront-Is-Tablet-Viewer': u'false', u'X-Forwarded-Port': u'443', u'Referer': u'https://xo8z7zafjh.execute-api.us-east-1.amazonaws.com/former/post', u'CloudFront-Is-Mobile-Viewer': u'false', u'X-Amz-Cf-Id': u'31zxcUcVyUxBOMk320yh5NOhihn5knqrlYQYpGGyOngKKwJb0J0BAQ==', u'CloudFront-Is-Desktop-Viewer': u'true'}, u'params': {u'parameter_1': u'post'}, u'method': u'POST', u'query': {}}
+        #event = {u'body': u'LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS03Njk1MjI4NDg0Njc4MTc2NTgwNjMwOTYxDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9Im15c3RyaW5nIg0KDQpkZGQNCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tNzY5NTIyODQ4NDY3ODE3NjU4MDYzMDk2MS0tDQo=', u'headers': {u'Content-Type': u'multipart/form-data; boundary=---------------------------7695228484678176580630961', u'Via': u'1.1 38205a04d96d60185e88658d3185ccee.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'CloudFront-Is-SmartTV-Viewer': u'false', u'CloudFront-Forwarded-Proto': u'https', u'X-Forwarded-For': u'71.231.27.57, 104.246.180.51', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:45.0) Gecko/20100101 Firefox/45.0', u'Host': u'xo2z7zafjh.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'Cookie': u'zappa=AQ4', u'CloudFront-Is-Tablet-Viewer': u'false', u'X-Forwarded-Port': u'443', u'Referer': u'https://xo8z7zafjh.execute-api.us-east-1.amazonaws.com/former/post', u'CloudFront-Is-Mobile-Viewer': u'false', u'X-Amz-Cf-Id': u'31zxcUcVyUxBOMk320yh5NOhihn5knqrlYQYpGGyOngKKwJb0J0BAQ==', u'CloudFront-Is-Desktop-Viewer': u'true'}, u'params': {u'parameter_1': u'post'}, u'method': u'POST', u'query': {}}
+
+        event = {
+            u'body': u'LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS03Njk1MjI4NDg0Njc4MTc2NTgwNjMwOTYxDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9Im15c3RyaW5nIg0KDQpkZGQNCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tNzY5NTIyODQ4NDY3ODE3NjU4MDYzMDk2MS0tDQo=',
+            u'resource': u'/',
+            u'requestContext': {
+                u'resourceId': u'6cqjw9qu0b',
+                u'apiId': u'9itr2lba55',
+                u'resourcePath': u'/',
+                u'httpMethod': u'POST',
+                u'requestId': u'c17cb1bf-867c-11e6-b938-ed697406e3b5',
+                u'accountId': u'724336686645',
+                u'identity': {
+                    u'apiKey': None,
+                    u'userArn': None,
+                    u'cognitoAuthenticationType': None,
+                    u'caller': None,
+                    u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:48.0) Gecko/20100101 Firefox/48.0',
+                    u'user': None,
+                    u'cognitoIdentityPoolId': None,
+                    u'cognitoIdentityId': None,
+                    u'cognitoAuthenticationProvider': None,
+                    u'sourceIp': u'50.191.225.98',
+                    u'accountId': None,
+                    },
+                u'stage': u'devorr',
+                },
+            u'queryStringParameters': None,
+            u'httpMethod': u'POST',
+            u'pathParameters': None,
+            u'headers': {u'Content-Type': u'multipart/form-data; boundary=---------------------------7695228484678176580630961', u'Via': u'1.1 38205a04d96d60185e88658d3185ccee.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'CloudFront-Is-SmartTV-Viewer': u'false', u'CloudFront-Forwarded-Proto': u'https', u'X-Forwarded-For': u'71.231.27.57, 104.246.180.51', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:45.0) Gecko/20100101 Firefox/45.0', u'Host': u'xo2z7zafjh.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'Cookie': u'zappa=AQ4', u'CloudFront-Is-Tablet-Viewer': u'false', u'X-Forwarded-Port': u'443', u'Referer': u'https://xo8z7zafjh.execute-api.us-east-1.amazonaws.com/former/post', u'CloudFront-Is-Mobile-Viewer': u'false', u'X-Amz-Cf-Id': u'31zxcUcVyUxBOMk320yh5NOhihn5knqrlYQYpGGyOngKKwJb0J0BAQ==', u'CloudFront-Is-Desktop-Viewer': u'true'},
+            u'stageVariables': None,
+            u'path': u'/',
+            }
+
+        environ = create_wsgi_request(event, trailing_slash=False)
+        response_tuple = collections.namedtuple('Response', ['status_code', 'content'])
+        response = response_tuple(200, 'hello')
+
+
+    def test_wsgi_without_body(self):
+        event = {
+            u'body': None,
+            u'resource': u'/',
+            u'requestContext': {
+                u'resourceId': u'6cqjw9qu0b',
+                u'apiId': u'9itr2lba55',
+                u'resourcePath': u'/',
+                u'httpMethod': u'POST',
+                u'requestId': u'c17cb1bf-867c-11e6-b938-ed697406e3b5',
+                u'accountId': u'724336686645',
+                u'identity': {
+                    u'apiKey': None,
+                    u'userArn': None,
+                    u'cognitoAuthenticationType': None,
+                    u'caller': None,
+                    u'userAgent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:48.0) Gecko/20100101 Firefox/48.0',
+                    u'user': None,
+                    u'cognitoIdentityPoolId': None,
+                    u'cognitoIdentityId': None,
+                    u'cognitoAuthenticationProvider': None,
+                    u'sourceIp': u'50.191.225.98',
+                    u'accountId': None,
+                    },
+                u'stage': u'devorr',
+                },
+            u'queryStringParameters': None,
+            u'httpMethod': u'POST',
+            u'pathParameters': None,
+            u'headers': {u'Via': u'1.1 38205a04d96d60185e88658d3185ccee.cloudfront.net (CloudFront)', u'Accept-Language': u'en-US,en;q=0.5', u'Accept-Encoding': u'gzip, deflate, br', u'CloudFront-Is-SmartTV-Viewer': u'false', u'CloudFront-Forwarded-Proto': u'https', u'X-Forwarded-For': u'71.231.27.57, 104.246.180.51', u'CloudFront-Viewer-Country': u'US', u'Accept': u'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', u'User-Agent': u'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:45.0) Gecko/20100101 Firefox/45.0', u'Host': u'xo2z7zafjh.execute-api.us-east-1.amazonaws.com', u'X-Forwarded-Proto': u'https', u'Cookie': u'zappa=AQ4', u'CloudFront-Is-Tablet-Viewer': u'false', u'X-Forwarded-Port': u'443', u'Referer': u'https://xo8z7zafjh.execute-api.us-east-1.amazonaws.com/former/post', u'CloudFront-Is-Mobile-Viewer': u'false', u'X-Amz-Cf-Id': u'31zxcUcVyUxBOMk320yh5NOhihn5knqrlYQYpGGyOngKKwJb0J0BAQ==', u'CloudFront-Is-Desktop-Viewer': u'true'},
+            u'stageVariables': None,
+            u'path': u'/',
+            }
+
         environ = create_wsgi_request(event, trailing_slash=False)
         response_tuple = collections.namedtuple('Response', ['status_code', 'content'])
         response = response_tuple(200, 'hello')
@@ -347,162 +541,6 @@ class TestZappa(unittest.TestCase):
     # Handler
     ##
 
-    @placebo_session
-    def test_handler(self, session):
-        # Init will test load_remote_settings
-        lh = LambdaHandler('test_settings', session=session)
-
-        # Annoyingly, this will fail during record, but
-        # the result will actually be okay to use in playback.
-        # See: https://github.com/garnaat/placebo/issues/48
-        self.assertEqual(os.environ['hello'], 'world')
-
-        event = {
-            "body": {},
-            "headers": {},
-            "params": {
-                "parameter_1": "asdf1",
-                "parameter_2": "asdf2",
-            },
-            "method": "GET",
-            "query": {}
-        }
-        lh.handler(event, None)
-
-        # Test scheduled event
-        event = {
-                    u'account': u'72333333333',
-                    u'region': u'us-east-1',
-                    u'detail': {},
-                    u'detail-type': u'Scheduled Event',
-                    u'source': u'aws.events',
-                    u'version': u'0',
-                    u'time': u'2016-05-10T21:05:39Z',
-                    u'id': u'0d6a6db0-d5e7-4755-93a0-750a8bf49d55',
-                    u'resources': [u'arn:aws:events:us-east-1:72333333333:rule/tests.test_app.schedule_me']
-                }
-        lh.handler(event, None)
-
-        # Test command event
-        event = {
-                    u'account': u'72333333333',
-                    u'region': u'us-east-1',
-                    u'detail': {},
-                    u'command': u'test_settings.command',
-                    u'source': u'aws.events',
-                    u'version': u'0',
-                    u'time': u'2016-05-10T21:05:39Z',
-                    u'id': u'0d6a6db0-d5e7-4755-93a0-750a8bf49d55',
-                    u'resources': [u'arn:aws:events:us-east-1:72333333333:rule/tests.test_app.schedule_me']
-                }
-        lh.handler(event, None)
-
-        # Test AWS S3 event
-        event = {
-                    u'account': u'72333333333',
-                    u'region': u'us-east-1',
-                    u'detail': {},
-                    u'Records': [{'s3': {'configurationId': 'test_settings.aws_s3_event'}}],
-                    u'source': u'aws.events',
-                    u'version': u'0',
-                    u'time': u'2016-05-10T21:05:39Z',
-                    u'id': u'0d6a6db0-d5e7-4755-93a0-750a8bf49d55',
-                    u'resources': [u'arn:aws:events:us-east-1:72333333333:rule/tests.test_app.schedule_me']
-                }
-        self.assertEqual("AWS S3 EVENT", lh.handler(event, None))
-
-        # Test AWS SNS event
-        event = {
-            u'account': u'72333333333',
-            u'region': u'us-east-1',
-            u'detail': {},
-            u'Records': [
-                {
-                    u'EventVersion': u'1.0',
-                    u'EventSource': u'aws:sns',
-                    u'EventSubscriptionArn': u'arn:aws:sns:EXAMPLE',
-                    u'Sns': {
-                        u'SignatureVersion': u'1',
-                        u'Timestamp': u'1970-01-01T00:00:00.000Z',
-                        u'Signature': u'EXAMPLE',
-                        u'SigningCertUrl': u'EXAMPLE',
-                        u'MessageId': u'95df01b4-ee98-5cb9-9903-4c221d41eb5e',
-                        u'Message': u'Hello from SNS!',
-                        u'Subject': u'TestInvoke',
-                        u'Type': u'Notification',
-                        u'UnsubscribeUrl': u'EXAMPLE',
-                        u'TopicArn': u'arn:aws:sns:1',
-                        u'MessageAttributes': {
-                            u'Test': {u'Type': u'String', u'Value': u'TestString'},
-                            u'TestBinary': {u'Type': u'Binary', u'Value': u'TestBinary'}
-                        }
-                    }
-                }
-            ]
-        }
-        self.assertEqual("AWS SNS EVENT", lh.handler(event, None))
-
-        # Test AWS DynamoDB event
-        event = {
-            u'Records': [
-                {
-                    u'eventID': u'1',
-                    u'eventVersion': u'1.0',
-                    u'dynamodb': {
-                        u'Keys': {u'Id': {u'N': u'101'}},
-                        u'NewImage': {u'Message': {u'S': u'New item!'}, u'Id': {u'N': u'101'}},
-                        u'StreamViewType': u'NEW_AND_OLD_IMAGES',
-                        u'SequenceNumber': u'111', u'SizeBytes': 26
-                    },
-                    u'awsRegion': u'us-west-2',
-                    u'eventName': u'INSERT',
-                    u'eventSourceARN': u'arn:aws:dynamodb:1',
-                    u'eventSource': u'aws:dynamodb'
-                }
-            ]
-        }
-        self.assertEqual("AWS DYNAMODB EVENT", lh.handler(event, None))
-
-        # Test AWS kinesis event
-        event = {
-            u'Records': [
-                {
-                    u'eventID': u'shardId-000000000000:49545115243490985018280067714973144582180062593244200961',
-                    u'eventVersion': u'1.0',
-                    u'kinesis': {
-                        u'partitionKey': u'partitionKey-3',
-                        u'data': u'SGVsbG8sIHRoaXMgaXMgYSB0ZXN0IDEyMy4=',
-                        u'kinesisSchemaVersion': u'1.0',
-                        u'sequenceNumber': u'49545115243490985018280067714973144582180062593244200961'
-                    },
-                    u'invokeIdentityArn': u'arn:aws:iam::EXAMPLE',
-                    u'eventName': u'aws:kinesis:record',
-                    u'eventSourceARN': u'arn:aws:kinesis:1',
-                    u'eventSource': u'aws:kinesis',
-                    u'awsRegion': u'us-east-1'
-                 }
-            ]
-        }
-        self.assertEqual("AWS KINESIS EVENT", lh.handler(event, None))
-
-        # Unhandled event
-        event = {
-            u'Records': [
-                {
-                    u'eventID': u'shardId-000000000000:49545115243490985018280067714973144582180062593244200961',
-                    u'eventVersion': u'1.0',
-                    u'kinesis': {
-                        u'partitionKey': u'partitionKey-3',
-                        u'data': u'SGVsbG8sIHRoaXMgaXMgYSB0ZXN0IDEyMy4=',
-                        u'kinesisSchemaVersion': u'1.0',
-                        u'sequenceNumber': u'49545115243490985018280067714973144582180062593244200961'
-                    },
-                    u'eventSourceARN': u'bad:arn:1',
-                }
-            ]
-        }
-        self.assertIsNone(lh.handler(event, None))
-
     ##
     # CLI
     ##
@@ -510,6 +548,61 @@ class TestZappa(unittest.TestCase):
     def test_cli_sanity(self):
         zappa_cli = ZappaCLI()
         return
+
+    def test_load_settings(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'ttt888'
+        zappa_cli.load_settings('test_settings.json')
+        self.assertEqual(False, zappa_cli.stage_config['touch'])
+
+    def test_load_extended_settings(self):
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'extendo'
+        zappa_cli.load_settings('test_settings.json')
+        self.assertEqual('lmbda', zappa_cli.stage_config['s3_bucket'])
+        self.assertEqual(True, zappa_cli.stage_config['touch'])
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'extendofail'
+        with self.assertRaises(ClickException):
+            zappa_cli.load_settings('test_settings.json')
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'ttt888'
+        with self.assertRaises(RuntimeError):
+            zappa_cli.load_settings('tests/test_bad_circular_extends_settings.json')
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'extendo2'
+        zappa_cli.load_settings('test_settings.json')
+        self.assertEqual('lmbda2', zappa_cli.stage_config['s3_bucket'])  # Second Extension
+        self.assertTrue(zappa_cli.stage_config['touch'])  # First Extension
+        self.assertTrue(zappa_cli.stage_config['delete_local_zip'])  # The base
+
+    def test_load_settings_yaml(self):
+        zappa_cli = ZappaCLI()
+        settings_file = zappa_cli.get_json_or_yaml_settings("test_settings")
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'ttt888'
+        zappa_cli.load_settings('tests/test_settings.yml')
+        self.assertEqual(False, zappa_cli.stage_config['touch'])
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'extendo'
+        zappa_cli.load_settings('tests/test_settings.yml')
+        self.assertEqual('lmbda', zappa_cli.stage_config['s3_bucket'])
+        self.assertEqual(True, zappa_cli.stage_config['touch'])
+
+    def test_load_settings_toml(self):
+        zappa_cli = ZappaCLI()
+        settings_file = zappa_cli.get_json_or_yaml_settings("test_settings")
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'ttt888'
+        zappa_cli.load_settings('tests/test_settings.toml')
+        self.assertEqual(False, zappa_cli.stage_config['touch'])
 
     def test_cli_utility(self):
         zappa_cli = ZappaCLI()
@@ -533,9 +626,26 @@ class TestZappa(unittest.TestCase):
             {
                 'timestamp': '12345',
                 'message': 'test'
+            },
+            {
+                'timestamp': '1480001341214',
+                'message': '[INFO] 2016-11-24T15:29:13.326Z c0cb52d1-b25a-11e6-9b73-f940ce24319a 59.111.125.48 - -  [24/Nov/2016:15:29:13 +0000] "GET / HTTP/1.1" 200 2590 "" "python-requests/2.11.0" 0/4.672'
+            },
+            {
+                'timestamp': '1480001341214',
+                'message': '[INFO] 2016-11-24T15:29:13.326Z c0cb52d1-b25a-11e6-9b73-f940ce24319a 59.111.125.48 - -  [24/Nov/2016:15:29:13 +0000] "GET / HTTP/1.1" 400 2590 "" "python-requests/2.11.0" 0/4.672'
+            },
+            {
+                'timestamp': '1480001341215',
+                'message': '[1480001341258] [DEBUG] 2016-11-24T15:29:01.258Z b890d8f6-b25a-11e6-b6bc-718f7ec807df Zappa Event: {}'
             }
         ]
         zappa_cli.print_logs(logs)
+        zappa_cli.print_logs(logs, colorize=False)
+        zappa_cli.print_logs(logs, colorize=False, http=True)
+        zappa_cli.print_logs(logs, colorize=True, http=True)
+        zappa_cli.print_logs(logs, colorize=True, http=False)
+        zappa_cli.check_for_update()
 
     def test_cli_args(self):
         zappa_cli = ZappaCLI()
@@ -543,90 +653,165 @@ class TestZappa(unittest.TestCase):
         argv = '-s test_settings.json derp ttt888'.split()
         zappa_cli.handle(argv)
 
-    @placebo_session
-    def test_cli_aws(self, session):
+    def test_cli_error_exit_code(self):
+        # Discussion: https://github.com/Miserlou/Zappa/issues/407
+        zappa_cli = ZappaCLI()
+        # Sanity
+        argv = '-s test_settings.json status devor'.split()
+        with self.assertRaises(SystemExit) as system_exit:
+            zappa_cli.handle(argv)
+        self.assertEqual(system_exit.exception.code, 1)
+
+    def test_cli_default(self):
+        # Discussion: https://github.com/Miserlou/Zappa/issues/422
+        zappa_cli = ZappaCLI()
+        argv = '-s tests/test_one_env.json status'.split()
+        # It'll fail, but at least it'll cover it.
+        with self.assertRaises(SystemExit) as system_exit:
+            zappa_cli.handle(argv)
+        self.assertEqual(system_exit.exception.code, 1)
+
+        zappa_cli = ZappaCLI()
+        argv = '-s tests/test_one_env.json status --all'.split()
+        # It'll fail, but at least it'll cover it.
+        with self.assertRaises(SystemExit) as system_exit:
+            zappa_cli.handle(argv)
+        self.assertEqual(system_exit.exception.code, 1)
+
+        zappa_cli = ZappaCLI()
+        argv = '-s test_settings.json status'.split()
+        with self.assertRaises(SystemExit) as system_exit:
+            zappa_cli.handle(argv)
+        self.assertEqual(system_exit.exception.code, 2)
+
+    def test_bad_json_catch(self):
+        zappa_cli = ZappaCLI()
+        self.assertRaises(ValueError, zappa_cli.load_settings_file, 'tests/test_bad_settings.json')
+
+    def test_bad_stage_name_catch(self):
+        zappa_cli = ZappaCLI()
+        self.assertRaises(ValueError, zappa_cli.load_settings, 'tests/test_bad_stage_name_settings.json')
+
+    def test_bad_environment_vars_catch(self):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = 'ttt888'
-        zappa_cli.api_key_required = True
-        zappa_cli.load_settings('test_settings.json', session)
-        zappa_cli.zappa.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
-        zappa_cli.deploy()
-        zappa_cli.update()
-        zappa_cli.rollback(1)
-        zappa_cli.tail(False)
-        zappa_cli.schedule()
-        zappa_cli.unschedule()
-        zappa_cli.undeploy(noconfirm=True, remove_logs=True)
-
-
-    @placebo_session
-    def test_cli_aws_status(self, session):
-        zappa_cli = ZappaCLI()
-        zappa_cli.api_stage = 'ttt888'
-        zappa_cli.load_settings('test_settings.json', session)
-        zappa_cli.api_stage = 'devor'
-        zappa_cli.lambda_name = 'baby-flask-devor'        
-        zappa_cli.zappa.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
-        resp = zappa_cli.status()
+        self.assertRaises(ValueError, zappa_cli.load_settings, 'tests/test_bad_environment_vars.json')
 
     def test_cli_init(self):
 
         if os.path.isfile('zappa_settings.json'):
             os.remove('zappa_settings.json')
 
+        # Test directly
         zappa_cli = ZappaCLI()
         # Via http://stackoverflow.com/questions/2617057/how-to-supply-stdin-files-and-environment-variable-inputs-to-python-unit-tests
-        inputs = ['dev', 'lmbda', 'test_settings', '']
+        inputs = ['dev', 'lmbda', 'test_settings', 'y', '']
+
+        def test_for(inputs):
+            input_generator = (i for i in inputs)
+            with mock.patch('__builtin__.raw_input', lambda prompt: next(input_generator)):
+                zappa_cli.init()
+
+            if os.path.isfile('zappa_settings.json'):
+                os.remove('zappa_settings.json')
+
+        test_for(inputs)
+        test_for(['dev', 'lmbda', 'test_settings', 'n', ''])
+        test_for(['dev', 'lmbda', 'test_settings', '', ''])
+        test_for(['dev', 'lmbda', 'test_settings', 'p', ''])
+        test_for(['dev', 'lmbda', 'test_settings', 'y', ''])
+        test_for(['dev', 'lmbda', 'test_settings', 'p', 'n'])
+
+
+        # Test via handle()
         input_generator = (i for i in inputs)
         with mock.patch('__builtin__.raw_input', lambda prompt: next(input_generator)):
-            zappa_cli.init()
+            zappa_cli = ZappaCLI()
+            argv = ['init']
+            zappa_cli.handle(argv)
 
         if os.path.isfile('zappa_settings.json'):
             os.remove('zappa_settings.json')
 
-        # with mock.patch('__builtin__.raw_input', lambda prompt: next(input_generator)):
-        #     zappa_cli = ZappaCLI()
-        #     argv = ['init']
-        #     zappa_cli.handle(argv)
-
-        # if os.path.isfile('zappa_settings.json'):
-        #     os.remove('zappa_settings.json')
-
     def test_domain_name_match(self):
         # Simple sanity check
-        zone = Zappa._get_best_match_zone(all_zones={ 'HostedZones': [
+        zone = Zappa.get_best_match_zone(all_zones={ 'HostedZones': [
             {
                 'Name': 'example.com.au.',
-                'Id': 'zone-correct'
+                'Id': 'zone-correct',
+                'Config': {
+                    'PrivateZone': False
+                }
             }
         ]},
             domain='www.example.com.au')
         assert zone == 'zone-correct'
 
         # No match test
-        zone = Zappa._get_best_match_zone(all_zones={'HostedZones': [
+        zone = Zappa.get_best_match_zone(all_zones={'HostedZones': [
             {
                 'Name': 'example.com.au.',
-                'Id': 'zone-incorrect'
+                'Id': 'zone-incorrect',
+                'Config': {
+                    'PrivateZone': False
+                }
             }
         ]},
             domain='something-else.com.au')
         assert zone is None
 
         # More involved, better match should win.
-        zone = Zappa._get_best_match_zone(all_zones={'HostedZones': [
+        zone = Zappa.get_best_match_zone(all_zones={'HostedZones': [
             {
                 'Name': 'example.com.au.',
-                'Id': 'zone-incorrect'
+                'Id': 'zone-incorrect',
+                'Config': {
+                    'PrivateZone': False
+                }
             },
             {
                 'Name': 'subdomain.example.com.au.',
-                'Id': 'zone-correct'
+                'Id': 'zone-correct',
+                'Config': {
+                    'PrivateZone': False
+                }
             }
         ]},
             domain='www.subdomain.example.com.au')
         assert zone == 'zone-correct'
 
+        # Check private zone is not matched
+        zone = Zappa.get_best_match_zone(all_zones={ 'HostedZones': [
+            {
+                'Name': 'example.com.au.',
+                'Id': 'zone-private',
+                'Config': {
+                    'PrivateZone': True
+                }
+            }
+        ]},
+            domain='www.example.com.au')
+        assert zone is None
+
+        # More involved, should ignore the private zone and match the public.
+        zone = Zappa.get_best_match_zone(all_zones={'HostedZones': [
+            {
+                'Name': 'subdomain.example.com.au.',
+                'Id': 'zone-private',
+                'Config': {
+                    'PrivateZone': True
+                }
+            },
+            {
+                'Name': 'subdomain.example.com.au.',
+                'Id': 'zone-public',
+                'Config': {
+                    'PrivateZone': False
+                }
+            }
+        ]},
+            domain='www.subdomain.example.com.au')
+        assert zone == 'zone-public'
 
     ##
     # Let's Encrypt / ACME
@@ -677,6 +862,12 @@ class TestZappa(unittest.TestCase):
             pass # that's fine.
 
         encode_certificate(b'123')
+
+        # without domain testing..
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'ttt888'
+        zappa_cli.load_settings('test_settings.json')
+        get_cert_and_update_domain(zappa_cli, 'kerplah', 'zzzz', domain=None, clean_up=True)
 
         os.remove('test_signed.crt')
         cleanup()
@@ -773,6 +964,17 @@ USE_TZ = True
         zappa.human_size(1)
         zappa.human_size(9999999999999)
 
+    def test_event_name(self):
+        zappa = Zappa()
+        truncated = zappa.get_event_name("basldfkjalsdkfjalsdkfjaslkdfjalsdkfjadlsfkjasdlfkjasdlfkjasdflkjasdf-asdfasdfasdfasdfasdf", "this.is.my.dang.function.wassup.yeah.its.long")
+        self.assertTrue(len(truncated) <= 64)
+        self.assertTrue(truncated.endswith("this.is.my.dang.function.wassup.yeah.its.long"))
+        truncated = zappa.get_event_name("basldfkjalsdkfjalsdkfjaslkdfjalsdkfjadlsfkjasdlfkjasdlfkjasdflkjasdf-asdfasdfasdfasdfasdf", "thisidoasdfaljksdfalskdjfalsdkfjasldkfjalsdkfjalsdkfjalsdfkjalasdfasdfasdfasdklfjasldkfjalsdkjfaslkdfjasldkfjasdflkjdasfskdj")
+        self.assertTrue(len(truncated) <= 64)
+        truncated = zappa.get_event_name("a", "b")
+        self.assertTrue(len(truncated) <= 64)
+        self.assertEqual(truncated, "a-b")
+
     def test_detect_dj(self):
         # Sanity
         settings_modules = detect_django_settings()
@@ -781,28 +983,60 @@ USE_TZ = True
         # Sanity
         settings_modules = detect_flask_apps()
 
-    @placebo_session
-    def test_add_event_source(self, session):
-
-        event_source = {'arn': 'blah:blah:blah:blah', 'events': [
-                    "s3:ObjectCreated:*"
-                  ]}
-        # Sanity. This should fail.
-        try:
-            es = add_event_source(event_source, 'blah:blah:blah:blah', 'test_settings.callback', session)
-            self.fail("Success should have failed.")
-        except ValueError:
-            pass
-
-        event_source = {'arn': 's3:s3:s3:s3', 'events': [
-                    "s3:ObjectCreated:*"
-                  ]}
-        add_event_source(event_source, 'lambda:lambda:lambda:lambda', 'test_settings.callback', session, dry=True)
-        remove_event_source(event_source, 'lambda:lambda:lambda:lambda', 'test_settings.callback', session, dry=True)
-        # get_event_source_status(event_source, 'lambda:lambda:lambda:lambda', 'test_settings.callback', session, dry=True)
-
     def test_shameless(self):
         shamelessly_promote()
+
+
+    def test_s3_url_parser(self):
+        remote_bucket, remote_file = parse_s3_url('s3://my-project-config-files/filename.json')
+        self.assertEqual(remote_bucket, 'my-project-config-files')
+        self.assertEqual(remote_file, 'filename.json')
+
+        remote_bucket, remote_file = parse_s3_url('s3://your-bucket/account.key')
+        self.assertEqual(remote_bucket, 'your-bucket')
+        self.assertEqual(remote_file, 'account.key')
+
+        remote_bucket, remote_file = parse_s3_url('s3://my-config-bucket/super-secret-config.json')
+        self.assertEqual(remote_bucket, 'my-config-bucket')
+        self.assertEqual(remote_file, 'super-secret-config.json')
+
+        remote_bucket, remote_file = parse_s3_url('s3://your-secure-bucket/account.key')
+        self.assertEqual(remote_bucket, 'your-secure-bucket')
+        self.assertEqual(remote_file, 'account.key')
+
+        remote_bucket, remote_file = parse_s3_url('s3://your-bucket/subfolder/account.key')
+        self.assertEqual(remote_bucket, 'your-bucket')
+        self.assertEqual(remote_file, 'subfolder/account.key')
+
+        # Sad path
+        remote_bucket, remote_file = parse_s3_url('/dev/null')
+        self.assertEqual(remote_bucket, '')
+
+
+    def test_remote_env_package(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'depricated_remote_env'
+        zappa_cli.load_settings('test_settings.json')
+        self.assertEqual('lmbda-env', zappa_cli.stage_config['remote_env_bucket'])
+        self.assertEqual('dev/env.json', zappa_cli.stage_config['remote_env_file'])
+        zappa_cli.create_package()
+        with zipfile.ZipFile(zappa_cli.zip_path, 'r') as lambda_zip:
+            content = lambda_zip.read('zappa_settings.py')
+        zappa_cli.remove_local_zip()
+        m = re.search("REMOTE_ENV='(.*)'", content)
+        self.assertEqual(m.group(1), 's3://lmbda-env/dev/env.json')
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = 'remote_env'
+        zappa_cli.load_settings('test_settings.json')
+        self.assertEqual('s3://lmbda-env/prod/env.json', zappa_cli.stage_config['remote_env'])
+        zappa_cli.create_package()
+        with zipfile.ZipFile(zappa_cli.zip_path, 'r') as lambda_zip:
+            content = lambda_zip.read('zappa_settings.py')
+        zappa_cli.remove_local_zip()
+        m = re.search("REMOTE_ENV='(.*)'", content)
+        self.assertEqual(m.group(1), 's3://lmbda-env/prod/env.json')
+
 
 if __name__ == '__main__':
     unittest.main()

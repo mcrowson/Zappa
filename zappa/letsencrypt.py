@@ -40,7 +40,7 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 
 
-def get_cert_and_update_domain(zappa_instance, lambda_name, api_stage, domain):
+def get_cert_and_update_domain(zappa_instance, lambda_name, api_stage, domain=None, clean_up=True):
     """
     Main cert installer path.
     """
@@ -59,33 +59,34 @@ def get_cert_and_update_domain(zappa_instance, lambda_name, api_stage, domain):
         with open('/tmp/intermediate.pem') as f:
             certificate_chain = f.read()
 
-        if not zappa_instance.get_domain_name(domain):
+        if domain:
+            if not zappa_instance.get_domain_name(domain):
 
-            zappa_instance.create_domain_name(
-                domain,
-                domain + "-Zappa-LE-Cert",
-                certificate_body,
-                certificate_private_key,
-                certificate_chain,
-                lambda_name,
-                api_stage
-            )
-            print("Created a new domain name. Please note that it can take up to 40 minutes for this domain to be created and propagated through AWS, but it requires no further work on your part.")
-        else:
-            zappa_instance.update_domain_name(
-                domain,
-                domain + "-Zappa-LE-Cert",
-                certificate_body,
-                certificate_private_key,
-                certificate_chain
-            )
+                zappa_instance.create_domain_name(
+                    domain,
+                    domain + "-Zappa-LE-Cert",
+                    certificate_body,
+                    certificate_private_key,
+                    certificate_chain,
+                    lambda_name,
+                    api_stage
+                )
+                print("Created a new domain name. Please note that it can take up to 40 minutes for this domain to be created and propagated through AWS, but it requires no further work on your part.")
+            else:
+                zappa_instance.update_domain_name(
+                    domain,
+                    domain + "-Zappa-LE-Cert",
+                    certificate_body,
+                    certificate_private_key,
+                    certificate_chain
+                )
 
     except Exception as e:
         print(e)
         return False
 
-    # Always clean-up.
-    cleanup()
+    if clean_up:
+        cleanup()
     return True
 
 
@@ -100,7 +101,7 @@ def create_domain_key():
         shell=True
     )
     out, err = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("OpenSSL Error: {0}".format(err))
     return True
 
@@ -113,7 +114,7 @@ def create_domain_csr(domain):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
     )
     out, err = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("OpenSSL Error: {0}".format(err))
     return True
 
@@ -129,7 +130,7 @@ def create_chained_certificate():
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
     )
     out, err = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("Error: {0}".format(err))
 
     return True
@@ -143,7 +144,7 @@ def parse_account_key():
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
     )
     out, err = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("OpenSSL Error: {0}".format(err))
 
     return out
@@ -160,7 +161,7 @@ def parse_csr():
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
     )
     out, err = proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("Error loading {0}: {1}".format(csr_filename, err))
     domains = set([])
     common_name = re.search(r"Subject:.*? CN=([^\s,;/]+)", out.decode('utf8'))
@@ -270,6 +271,9 @@ def get_cert(zappa_instance, log=LOGGER, CA=DEFAULT_CA):
         # wait for challenge to be verified
         verify_challenge(challenge['uri'])
 
+        # Challenge verified, clean up R53
+        zappa_instance.remove_dns_challenge_txt(zone_id, domain, digest)
+
     # Sign
     result = sign_certificate()
     # Encode to PEM formate
@@ -363,7 +367,7 @@ def _send_signed_request(url, payload):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
     )
     out, err = proc.communicate("{0}.{1}".format(protected64, payload64).encode('utf8'))
-    if proc.returncode != 0:
+    if proc.returncode != 0: # pragma: no cover
         raise IOError("OpenSSL Error: {0}".format(err))
     data = json.dumps({
         "header": header, "protected": protected64,

@@ -1,7 +1,14 @@
 import fnmatch
+import json
 import os
+import requests
 import shutil
 import stat
+import urlparse
+
+##
+# Settings / Packaging
+##
 
 def copytree(src, dst, symlinks=False, ignore=None):
     """
@@ -37,6 +44,24 @@ def copytree(src, dst, symlinks=False, ignore=None):
             copytree(s, d, symlinks, ignore)
         else:
             shutil.copy2(s, d)
+
+def parse_s3_url(url):
+    """
+    Parses S3 URL.
+
+    Returns bucket (domain) and file (full path).
+    """
+    bucket = ''
+    path = ''
+    if url:
+        result = urlparse.urlparse(url)
+        bucket = result.netloc
+        path = result.path.strip('/')
+    return bucket, path
+
+##
+# `init` related
+##
 
 def detect_django_settings():
     """
@@ -94,6 +119,10 @@ def detect_flask_apps():
 
     return matches
 
+##
+# Event sources / Kappa
+##
+
 def get_event_source(event_source, lambda_arn, target_function, boto_session, dry=False):
     """
 
@@ -130,13 +159,12 @@ def get_event_source(event_source, lambda_arn, target_function, boto_session, dr
     }
 
     arn = event_source['arn']
-    events = event_source['events']
     _, _, svc, _ = arn.split(':', 3)
 
     event_source_func = event_source_map.get(svc, None)
     if not event_source_func:
         raise ValueError('Unknown event source: {0}'.format(arn))
-    
+
     def autoreturn(self, function_name):
         return function_name
 
@@ -146,8 +174,8 @@ def get_event_source(event_source, lambda_arn, target_function, boto_session, dr
     ctx.session = boto_session
 
     funk = PseudoFunction()
-    funk.name = target_function
-    
+    funk.name = lambda_arn
+
     # Kappa 0.6.0 requires this nasty hacking,
     # hopefully we can remove at least some of this soon.
     if svc == 's3':
@@ -156,6 +184,7 @@ def get_event_source(event_source, lambda_arn, target_function, boto_session, dr
         arn_back = split_arn[-1]
         ctx.environment = arn_back
         funk.arn = arn_front
+        funk.name = ':'.join([arn_back, target_function])
     else:
         funk.arn = lambda_arn
 
@@ -171,11 +200,18 @@ def add_event_source(event_source, lambda_arn, target_function, boto_session, dr
     """
 
     event_source_obj, ctx, funk = get_event_source(event_source, lambda_arn, target_function, boto_session, dry=False)
+    # TODO: Detect changes in config and refine exists algorithm
     if not dry:
-        rule_response = event_source_obj.add(funk)
-        return rule_response
-    else:
-        return event_source_obj
+        if not event_source_obj.status(funk):
+            event_source_obj.add(funk)
+            if event_source_obj.status(funk):
+                return 'successful'
+            else:
+                return 'failed'
+        else:
+            return 'exists'
+
+    return 'dryrun'
 
 def remove_event_source(event_source, lambda_arn, target_function, boto_session, dry=False):
     """
@@ -183,7 +219,7 @@ def remove_event_source(event_source, lambda_arn, target_function, boto_session,
     """
 
     event_source_obj, ctx, funk = get_event_source(event_source, lambda_arn, target_function, boto_session, dry=False)
-    
+
     # This is slightly dirty, but necessary for using Kappa this way.
     funk.arn = lambda_arn
     if not dry:
@@ -199,3 +235,24 @@ def get_event_source_status(event_source, lambda_arn, target_function, boto_sess
 
     event_source_obj, ctx, funk = get_event_source(event_source, lambda_arn, target_function, boto_session, dry=False)
     return event_source_obj.status(funk)
+
+##
+# Analytics / Surveillance / Nagging
+##
+
+def check_new_version_available(this_version):
+    """
+    Checks if a newer version of Zappa is available.
+
+    Returns True is updateable, else False.
+
+    """
+
+    pypi_url = 'https://pypi.python.org/pypi/Zappa/json'
+    resp = requests.get(pypi_url, timeout=1.5)
+    top_version = resp.json()['info']['version']
+
+    if this_version != top_version:
+        return True
+    else:
+        return False

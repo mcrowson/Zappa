@@ -1,6 +1,5 @@
 from __future__ import unicode_literals
 
-import base64
 import datetime
 import importlib
 import logging
@@ -20,10 +19,13 @@ try:
     from zappa.cli import ZappaCLI
     from zappa.middleware import ZappaWSGIMiddleware
     from zappa.wsgi import create_wsgi_request, common_log
+    from zappa.util import parse_s3_url
 except ImportError as e:  # pragma: no cover
     from .cli import ZappaCLI
     from .middleware import ZappaWSGIMiddleware
     from .wsgi import create_wsgi_request, common_log
+    from .util import parse_s3_url
+
 
 # Set up logging
 logging.basicConfig()
@@ -64,6 +66,11 @@ class LambdaHandler(object):
     settings_name = None
     session = None
 
+    # Application
+    app_module = None
+    wsgi_app = None
+    trailing_slash = False
+
     def __new__(cls, settings_name="zappa_settings", session=None):
         """Singleton instance to avoid repeat setup"""
         if LambdaHandler.__instance is None:
@@ -72,29 +79,57 @@ class LambdaHandler(object):
 
     def __init__(self, settings_name="zappa_settings", session=None):
 
-        # Loading settings from a python module
-        self.settings = importlib.import_module(settings_name)
-        self.settings_name = settings_name
-        self.session = session
+        # We haven't cached our settings yet, load the settings and app.
+        if not self.settings:
+            # Loading settings from a python module
+            self.settings = importlib.import_module(settings_name)
+            self.settings_name = settings_name
+            self.session = session
 
-        remote_bucket = getattr(self.settings, 'REMOTE_ENV_BUCKET', None)
-        remote_file = getattr(self.settings, 'REMOTE_ENV_FILE', None)
+            # Custom log level
+            if self.settings.LOG_LEVEL:
+                level = logging.getLevelName(self.settings.LOG_LEVEL)
+                logger.setLevel(level)
 
-        if remote_bucket and remote_file:
-            self.load_remote_settings(remote_bucket, remote_file)
+            remote_env = getattr(self.settings, 'REMOTE_ENV', None)
+            remote_bucket, remote_file = parse_s3_url(remote_env)
 
-        # Let the system know that this will be a Lambda/Zappa/Stack
-        os.environ["SERVERTYPE"] = "AWS Lambda"
-        os.environ["FRAMEWORK"] = "Zappa"
-        try:
-            os.environ["PROJECT"] = self.settings.PROJECT_NAME
-            os.environ["STAGE"] = self.settings.API_STAGE
-        except Exception:  # pragma: no cover
-            pass
+            if remote_bucket and remote_file:
+                self.load_remote_settings(remote_bucket, remote_file)
 
-        # Set any locally defined env vars
-        for key in self.settings.ENVIRONMENT_VARIABLES.keys():
-            os.environ[key] = self.settings.ENVIRONMENT_VARIABLES[key]
+            # Let the system know that this will be a Lambda/Zappa/Stack
+            os.environ["SERVERTYPE"] = "AWS Lambda"
+            os.environ["FRAMEWORK"] = "Zappa"
+            try:
+                os.environ["PROJECT"] = self.settings.PROJECT_NAME
+                os.environ["STAGE"] = self.settings.API_STAGE
+            except Exception:  # pragma: no cover
+                pass
+
+            # Set any locally defined env vars
+            for key in self.settings.ENVIRONMENT_VARIABLES.keys():
+                os.environ[key] = self.settings.ENVIRONMENT_VARIABLES[key]
+
+            # Django gets special treatment.
+            if not self.settings.DJANGO_SETTINGS:
+                # The app module
+                self.app_module = importlib.import_module(self.settings.APP_MODULE)
+
+                # The application
+                wsgi_app_function = getattr(self.app_module, self.settings.APP_FUNCTION)
+                self.trailing_slash = False
+            else:
+
+                try:  # Support both for tests
+                    from zappa.ext.django import get_django_wsgi
+                except ImportError:  # pragma: no cover
+                    from django_zappa_app import get_django_wsgi
+
+                # Get the Django WSGI app from our extension
+                wsgi_app_function = get_django_wsgi(self.settings.DJANGO_SETTINGS)
+                self.trailing_slash = True
+
+            self.wsgi_app = ZappaWSGIMiddleware(wsgi_app_function)
 
     def load_remote_settings(self, remote_bucket, remote_file):
         """
@@ -172,7 +207,7 @@ class LambdaHandler(object):
             if not exception_processed:
                 # Only re-raise exception if handler directed so. Allows handler to control if lambda has to retry
                 # an event execution in case of failure.
-                raise ex
+                raise
 
     @classmethod
     def _process_exception(cls, exception_handler, event, context, exception):
@@ -226,7 +261,7 @@ class LambdaHandler(object):
         Support S3, SNS, DynamoDB and kinesis events
         """
         if 's3' in record:
-            return record['s3']['configurationId']
+            return record['s3']['configurationId'].split(':')[-1]
 
         arn = None
         if 'Sns' in record:
@@ -250,13 +285,7 @@ class LambdaHandler(object):
 
         # If in DEBUG mode, log all raw incoming events.
         if settings.DEBUG:
-            print('Zappa Event: {}'.format(event))
             logger.debug('Zappa Event: {}'.format(event))
-
-        # Custom log level
-        if settings.LOG_LEVEL:
-            level = logging.getLevelName(settings.LOG_LEVEL)
-            logger.setLevel(level)
 
         # This is the result of a keep alive, recertify
         # or scheduled event.
@@ -283,6 +312,15 @@ class LambdaHandler(object):
             print(result)
             return result
 
+        # This is a direct, raw python invocation.
+        # It's _extremely_ important we don't allow this event source
+        # to be overriden by unsanitized, non-admin user input.
+        elif event.get('raw_command', None):
+
+            raw_command = event['raw_command']
+            exec(raw_command)
+            return
+
         # This is a Django management command invocation.
         elif event.get('manage', None):
 
@@ -308,49 +346,39 @@ class LambdaHandler(object):
 
             records = event.get('Records')
             result = None
-            for record in records:
-                whole_function = self.get_function_for_aws_event(record)
-                if whole_function:
-                    app_function = self.import_module_and_get_function(whole_function)
-                    result = self.run_function(app_function, event, context)
-                    logger.debug(result)
-                else:
-                    logger.error("Cannot find a function to process the triggered event.")
+            whole_function = self.get_function_for_aws_event(records[0])
+            if whole_function:
+                app_function = self.import_module_and_get_function(whole_function)
+                result = self.run_function(app_function, event, context)
+                logger.debug(result)
+            else:
+                logger.error("Cannot find a function to process the triggered event.")
             return result
 
+        # This is an API Gateway authorizer event
+        elif event.get('type') == u'TOKEN':
+            whole_function = self.settings.AUTHORIZER_FUNCTION
+            if whole_function:
+                app_function = self.import_module_and_get_function(whole_function)
+                policy = self.run_function(app_function, event, context)
+                return policy
+            else:
+                logger.error("Cannot find a function to process the authorization request.")
+                raise Exception('Unauthorized')
+
+        # Normal web app flow
         try:
             # Timing
             time_start = datetime.datetime.now()
 
-            # Django gets special treatment.
-            if not settings.DJANGO_SETTINGS:
-                # The app module
-                app_module = importlib.import_module(settings.APP_MODULE)
-
-                # The application
-                app_function = getattr(app_module, settings.APP_FUNCTION)
-                trailing_slash = False
-            else:
-
-                try:  # Support both for tests
-                    from zappa.ext.django import get_django_wsgi
-                except ImportError as e:  # pragma: no cover
-                    from django_zappa_app import get_django_wsgi
-
-                # Get the Django WSGI app from our extension
-                app_function = get_django_wsgi(settings.DJANGO_SETTINGS)
-                trailing_slash = True
-
-            app = ZappaWSGIMiddleware(app_function)
-
             # This is a normal HTTP request
-            if event.get('method', None):
+            if event.get('httpMethod', None):
                 # If we just want to inspect this,
                 # return this event instead of processing the request
                 # https://your_api.aws-api.com/?event_echo=true
-                event_echo = getattr(settings, "EVENT_ECHO", True)
-                if event_echo and 'event_echo' in event['params'].values():
-                    return {'Content': str(event) + '\n' + str(context), 'Status': 200}
+                # event_echo = getattr(settings, "EVENT_ECHO", True)
+                # if event_echo and 'event_echo' in event['params'].values():
+                #     return {'Content': str(event) + '\n' + str(context), 'Status': 200}
 
                 if settings.DOMAIN:
                     # If we're on a domain, we operate normally
@@ -366,7 +394,7 @@ class LambdaHandler(object):
                 environ = create_wsgi_request(
                     event,
                     script_name=script_name,
-                    trailing_slash=trailing_slash
+                    trailing_slash=self.trailing_slash
                 )
 
                 # We are always on https on Lambda, so tell our wsgi app that.
@@ -375,38 +403,43 @@ class LambdaHandler(object):
                 environ['lambda.context'] = context
 
                 # Execute the application
-                response = Response.from_app(app, environ)
+                response = Response.from_app(self.wsgi_app, environ)
 
                 # This is the object we're going to return.
                 # Pack the WSGI response into our special dictionary.
-                zappa_returndict = dict(response.headers)
+                zappa_returndict = dict()
 
-                if 'Content' not in zappa_returndict and response.data:
-                    zappa_returndict['Content'] = response.data
+                if response.data:
+                    zappa_returndict['body'] = response.data
 
-                zappa_returndict['Status'] = response.status_code
+                zappa_returndict['statusCode'] = response.status_code
+                zappa_returndict['headers'] = {}
+                for key, value in response.headers:
+                    zappa_returndict['headers'][key] = value
 
                 # To ensure correct status codes, we need to
                 # pack the response as a deterministic B64 string and raise it
                 # as an error to match our APIGW regex.
                 # The DOCTYPE ensures that the page still renders in the browser.
-                exception = None
-                if response.status_code in ERROR_CODES:
-                    content = collections.OrderedDict()
-                    content['http_status'] = response.status_code
-                    content['content'] = base64.b64encode(response.data.encode('utf-8'))
-                    exception = json.dumps(content)
-                # Internal are changed to become relative redirects
-                # so they still work for apps on raw APIGW and on a domain.
-                elif 300 <= response.status_code < 400 and hasattr(response, 'Location'):
-                    # Location is by default relative on Flask. Location is by default
-                    # absolute on Werkzeug. We can set autocorrect_location_header on
-                    # the response to False, but it doesn't work. We have to manually
-                    # remove the host part.
-                    location = response.location
-                    hostname = 'https://' + environ['HTTP_HOST']
-                    if location.startswith(hostname):
-                        exception = location[len(hostname):]
+                exception = None  # this variable never used
+                # if response.status_code in ERROR_CODES:
+                #     content = collections.OrderedDict()
+                #     content['http_status'] = response.status_code
+                #     content['content'] = base64.b64encode(response.data.encode('utf-8'))
+                #     exception = json.dumps(content)
+                # # Internal are changed to become relative redirects
+                # # so they still work for apps on raw APIGW and on a domain.
+                # elif 300 <= response.status_code < 400 and hasattr(response, 'Location'):
+                #     # Location is by default relative on Flask. Location is by default
+                #     # absolute on Werkzeug. We can set autocorrect_location_header on
+                #     # the response to False, but it doesn't work. We have to manually
+                #     # remove the host part.
+                #     location = response.location
+                #     hostname = 'https://' + environ['HTTP_HOST']
+                #     if location.startswith(hostname):
+                #         exception = location[len(hostname):]
+                #     else:
+                #         exception = location
 
                 # Calculate the total response time,
                 # and log it in the Common Log format.
@@ -416,36 +449,30 @@ class LambdaHandler(object):
                 response.content = response.data
                 common_log(environ, response, response_time=response_time_ms)
 
-                # Finally, return the response to API Gateway.
-                if exception:  # pragma: no cover
-                    raise WSGIException(exception)
-                else:
-                    return zappa_returndict
-        except WSGIException as e:  # pragma: no cover
-            raise e
+                return zappa_returndict
         except Exception as e:  # pragma: no cover
 
             # Print statements are visible in the logs either way
             print(e)
             exc_info = sys.exc_info()
-            message = 'An uncaught exception happened while servicing this request.'
+            message = ('An uncaught exception happened while servicing this request. '
+                       'You can investigate this with the `zappa tail` command.')
 
             # If we didn't even build an app_module, just raise.
             if not settings.DJANGO_SETTINGS:
                 try:
-                    app_module
+                    self.app_module
                 except NameError as ne:
                     message = 'Failed to import module: {}'.format(ne.message)
 
             # Return this unspecified exception as a 500, using template that API Gateway expects.
             content = collections.OrderedDict()
-            content['http_status'] = 500
+            content['statusCode'] = 500
             body = {'message': message}
             if settings.DEBUG:  # only include traceback if debug is on.
                 body['traceback'] = traceback.format_exception(*exc_info)  # traceback as a list for readability.
-            content['content'] = base64.b64encode(json.dumps(body, sort_keys=True, indent=4).encode('utf-8'))
-            exception = json.dumps(content)
-            raise UncaughtWSGIException(exception, original=e), None, exc_info[2]  # Keep original traceback.
+            content['body'] = json.dumps(body, sort_keys=True, indent=4).encode('utf-8')
+            return content
 
 
 def lambda_handler(event, context):  # pragma: no cover

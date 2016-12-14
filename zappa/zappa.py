@@ -1,7 +1,10 @@
-import base64
+from __future__ import print_function
+
+import glob
+from setuptools import find_packages
+
 import boto3
 import botocore
-import datetime
 import json
 import logging
 import os
@@ -13,12 +16,14 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import troposphere
+import troposphere.apigateway
 import zipfile
 
-import kappa
 from distutils.dir_util import copy_tree
 
 from botocore.exceptions import ClientError
+from io import BytesIO
 from lambda_packages import lambda_packages
 from tqdm import tqdm
 
@@ -143,6 +148,13 @@ ATTACH_POLICY = """{
         {
             "Effect": "Allow",
             "Action": [
+                "kinesis:*"
+            ],
+            "Resource": "arn:aws:kinesis:*:*:*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "sns:*"
             ],
             "Resource": "arn:aws:sns:*:*:*"
@@ -175,14 +187,22 @@ RESPONSE_TEMPLATE = """#set($inputRoot = $input.path('$'))\n$inputRoot.Content""
 ERROR_RESPONSE_TEMPLATE = """#set($_body = $util.parseJson($input.path('$.errorMessage'))['content'])\n$util.base64Decode($_body)"""
 REDIRECT_RESPONSE_TEMPLATE = ""
 
-API_GATEWAY_REGIONS = ['us-east-1', 'us-west-2', 'eu-west-1', 'eu-central-1', 'ap-northeast-1', 'ap-southeast-2']
-LAMBDA_REGIONS = ['us-east-1', 'us-west-2', 'eu-west-1', 'eu-central-1', 'ap-northeast-1', 'ap-southeast-2']
+# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
+API_GATEWAY_REGIONS = ['us-east-1', 'us-east-2', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-northeast-1',
+                       'ap-northeast-2', 'ap-southeast-1', 'ap-southeast-2']
+# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
+LAMBDA_REGIONS = ['us-east-1', 'us-east-2', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-northeast-1',
+                  'ap-northeast-2', 'ap-southeast-1', 'ap-southeast-2']
 
-ZIP_EXCLUDES =  ['*.exe', '*.DS_Store', '*.Python', '*.git', '.git/*', '*.zip', '*.tar.gz', '*.hg', '*.egg-info', 'botocore*', 'pip', 'docutils*', 'boto3*', 'setuputils*', '*.dist-info']
+ZIP_EXCLUDES = [
+    '*.exe', '*.DS_Store', '*.Python', '*.git', '.git/*', '*.zip', '*.tar.gz',
+    '*.hg', '*.egg-info', 'pip', 'docutils*', 'setuputils*'
+]
 
 ##
 # Classes
 ##
+
 
 class Zappa(object):
     """
@@ -191,25 +211,20 @@ class Zappa(object):
     Makes it easy to run Python web applications on AWS Lambda/API Gateway.
 
     """
+
     ##
     # Configurables
     ##
 
     http_methods = [
-        'DELETE',
-        'GET',
-        'HEAD',
-        'OPTIONS',
-        'PATCH',
-        'POST',
-        'PUT'
+        'ANY'
     ]
     parameter_depth = 8
-    integration_response_codes = [200, 201, 301, 400, 401, 403, 404, 500]
+    integration_response_codes = [200, 201, 301, 400, 401, 403, 404, 405, 500]
     integration_content_types = [
         'text/html',
     ]
-    method_response_codes = [200, 201, 301, 400, 401, 403, 404, 500]
+    method_response_codes = [200, 201, 301, 400, 401, 403, 404, 405, 500]
     method_content_types = [
         'text/html',
     ]
@@ -224,7 +239,6 @@ class Zappa(object):
     role_name = "ZappaLambdaExecution"
     assume_policy = ASSUME_POLICY
     attach_policy = ATTACH_POLICY
-    aws_region = 'us-east-1'
     cloudwatch_log_levels = ['OFF', 'ERROR', 'INFO']
 
     ##
@@ -234,8 +248,14 @@ class Zappa(object):
     boto_session = None
     credentials_arn = None
 
-    def __init__(self, boto_session=None, profile_name=None, aws_region=aws_region, load_credentials=True):
-        self.aws_region = aws_region
+    def __init__(self, boto_session=None, profile_name=None, aws_region=None, load_credentials=True):
+        # Set aws_region to None to use the system's region instead
+        if aws_region is None:
+            # https://github.com/Miserlou/Zappa/issues/413
+            self.aws_region = boto3.Session().region_name
+            logger.debug("Set region from boto: %s", self.aws_region)
+        else:
+            self.aws_region = aws_region
 
         # Some common invokations, such as DB migrations,
         # can take longer than the default.
@@ -260,34 +280,61 @@ class Zappa(object):
         self.logs_client = self.boto_session.client('logs')
         self.iam_client = self.boto_session.client('iam')
         self.iam = self.boto_session.resource('iam')
-        self.s3 = self.boto_session.resource('s3')
         self.cloudwatch = self.boto_session.client('cloudwatch')
         self.route53 = self.boto_session.client('route53')
+        self.cf_client = self.boto_session.client('cloudformation')
+        self.cf_template = troposphere.Template()
+        self.cf_api_resources = []
+        self.cf_parameters = {}
+
+
+    def cache_param(self, value):
+        '''Returns a troposphere Ref to a value cached as a parameter.'''
+
+        if value not in self.cf_parameters:
+            keyname = chr(ord('A') + len(self.cf_parameters))
+            param = self.cf_template.add_parameter(troposphere.Parameter(
+                keyname, Type="String", Default=value
+            ))
+
+            self.cf_parameters[value] = param
+
+        return troposphere.Ref(self.cf_parameters[value])
 
     ##
     # Packaging
     ##
+    def copy_editable_packages(self, egg_links, temp_package_path):
+        for egg_link in egg_links:
+            with open(egg_link) as df:
+                egg_path = df.read().decode('utf-8').splitlines()[0].strip()
+                pkgs = set([x.split(".")[0] for x in find_packages(egg_path, exclude=['test', 'tests'])])
+                for pkg in pkgs:
+                    copytree(os.path.join(egg_path, pkg), os.path.join(temp_package_path, pkg), symlinks=False)
+
+        if temp_package_path:
+            # now remove any egg-links as they will cause issues if they still exist
+            for link in glob.glob(os.path.join(temp_package_path, "*.egg-link")):
+                os.remove(link)
 
     def create_lambda_zip(self, prefix='lambda_package', handler_file=None,
                           minify=True, exclude=None, use_precompiled_packages=True, include=None, venv=None):
         """
-        Creates a Lambda-ready zip file of the current virtualenvironment and working directory.
+        Create a Lambda-ready zip file of the current virtualenvironment and working directory.
 
         Returns path to that file.
 
         """
         import pip
 
-        print("Packaging project as zip...")
-
         if not venv:
             if 'VIRTUAL_ENV' in os.environ:
                 venv = os.environ['VIRTUAL_ENV']
-            elif os.path.exists('.python-version'): # pragma: no cover
+            elif os.path.exists('.python-version'):  # pragma: no cover
                 logger.debug("Pyenv's local virtualenv detected.")
                 try:
                     subprocess.check_output('pyenv', stderr=subprocess.STDOUT)
-                except OSError as e:
+                except OSError:
                     print("This directory seems to have pyenv's local venv"
                           "but pyenv executable was not found.")
                 with open('.python-version', 'r') as f:
@@ -296,7 +343,7 @@ class Zappa(object):
                 bin_path = subprocess.check_output(['pyenv', 'which', 'python']).decode('utf-8')
                 venv = bin_path[:bin_path.rfind(env_name)] + env_name
                 logger.debug('env path = {}'.format(venv))
-            else: # pragma: no cover
+            else:  # pragma: no cover
                 print("Zappa requires an active virtual environment.")
                 quit()
 
@@ -324,8 +371,12 @@ class Zappa(object):
 
         # Ideally this should be avoided automatically,
         # but this serves as an okay stop-gap measure.
-        if split_venv[-1] == split_cwd[-1]: # pragma: no cover
-            print("Warning! Your project and virtualenv have the same name! You may want to re-create your venv with a new name, or explicitly define a 'project_name', as this may cause errors.")
+        if split_venv[-1] == split_cwd[-1]:  # pragma: no cover
+            print(
+                "Warning! Your project and virtualenv have the same name! You may want "
+                "to re-create your venv with a new name, or explicitly define a "
+                "'project_name', as this may cause errors."
+            )
 
         # First, do the project..
         temp_project_path = os.path.join(tempfile.gettempdir(), str(int(time.time())))
@@ -337,33 +388,60 @@ class Zappa(object):
             copytree(cwd, temp_project_path, symlinks=False)
 
         # Then, do the site-packages..
+        egg_links = []
         temp_package_path = os.path.join(tempfile.gettempdir(), str(int(time.time() + 1)))
         if os.sys.platform == 'win32':
             site_packages = os.path.join(venv, 'Lib', 'site-packages')
         else:
             site_packages = os.path.join(venv, 'lib', 'python2.7', 'site-packages')
+        egg_links.extend(glob.glob(os.path.join(site_packages, '*.egg-link')))
+
         if minify:
             excludes = ZIP_EXCLUDES + exclude
             copytree(site_packages, temp_package_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
+
         else:
             copytree(site_packages, temp_package_path, symlinks=False)
 
         # We may have 64-bin specific packages too.
         site_packages_64 = os.path.join(venv, 'lib64', 'python2.7', 'site-packages')
         if os.path.exists(site_packages_64):
+            egg_links.extend(glob.glob(os.path.join(site_packages_64, '*.egg-link')))
             if minify:
                 excludes = ZIP_EXCLUDES + exclude
                 copytree(site_packages_64, temp_package_path, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
             else:
                 copytree(site_packages_64, temp_package_path, symlinks=False)
 
+        if egg_links:
+            self.copy_editable_packages(egg_links, temp_package_path)
+
         copy_tree(temp_package_path, temp_project_path, update=True)
 
         # Then the pre-compiled packages..
         if use_precompiled_packages:
-            installed_packages_name_set = {package.project_name.lower() for package in
-                                           pip.get_installed_distributions()}
+            print("Downloading and installing dependencies..")
+            installed_packages_name_set = [package.project_name.lower() for package in
+                                           pip.get_installed_distributions()]
 
+            # First try to use manylinux packages from PyPi..
+            # Related: https://github.com/Miserlou/Zappa/issues/398
+            progress = tqdm(total=len(installed_packages_name_set), unit_scale=False, unit='pkg')
+            try:
+                for installed_package_name in installed_packages_name_set:
+                    wheel_url = self.get_manylinux_wheel(installed_package_name)
+                    if wheel_url:
+                        resp = requests.get(wheel_url, timeout=2, stream=True)
+                        resp.raw.decode_content = True
+                        zipresp = resp.raw
+                        with zipfile.ZipFile(BytesIO(zipresp.read())) as zfile:
+                            zfile.extractall(temp_package_path)
+                    progress.update()
+            except Exception:
+                pass # XXX - What should we do here?
+            progress.close()
+
+            # ..then, do lambda-packages.
             for name, details in lambda_packages.items():
                 if name.lower() in installed_packages_name_set:
                     tar = tarfile.open(details['path'], mode="r:gz")
@@ -382,10 +460,11 @@ class Zappa(object):
             shutil.copy(handler_file, os.path.join(temp_project_path, filename))
 
         # Then zip it all up..
+        print("Packaging project as zip..")
         try:
-            import zlib
+            # import zlib
             compression_method = zipfile.ZIP_DEFLATED
-        except ImportError as e: # pragma: no cover
+        except ImportError:  # pragma: no cover
             compression_method = zipfile.ZIP_STORED
 
         zipf = zipfile.ZipFile(zip_path, 'w', compression_method)
@@ -393,10 +472,16 @@ class Zappa(object):
 
             for filename in files:
 
+                # Skip .pyc files for Django migrations
+                # https://github.com/Miserlou/Zappa/issues/436
+                # https://github.com/Miserlou/Zappa/issues/464
+                if filename[-4:] == '.pyc' and root[-10:] == 'migrations':
+                    continue
+
                 # If there is a .pyc file in this package,
                 # we can skip the python source code as we'll just
                 # use the compiled bytecode anyway..
-                if filename[-3:] == '.py':
+                if filename[-3:] == '.py' and root[-10:] != 'migrations':
                     abs_filname = os.path.join(root, filename)
                     abs_pyc_filename = abs_filname + 'c'
                     if os.path.isfile(abs_pyc_filename):
@@ -414,7 +499,9 @@ class Zappa(object):
             if '__init__.py' not in files:
                 tmp_init = os.path.join(temp_project_path, '__init__.py')
                 open(tmp_init, 'a').close()
-                zipf.write(tmp_init, os.path.join(root.replace(temp_project_path, ''), os.path.join(root.replace(temp_project_path, ''), '__init__.py')))
+                zipf.write(tmp_init,
+                           os.path.join(root.replace(temp_project_path, ''),
+                                        os.path.join(root.replace(temp_project_path, ''), '__init__.py')))
 
         # And, we're done!
         zipf.close()
@@ -425,43 +512,58 @@ class Zappa(object):
 
         # Warn if this is too large for Lambda.
         file_stats = os.stat(zip_path)
-        if file_stats.st_size > 52428800: # pragma: no cover
+        if file_stats.st_size > 52428800:  # pragma: no cover
             print("\n\nWarning: Application zip package is likely to be too large for AWS Lambda.\n\n")
 
         return zip_fname
+
+    def get_manylinux_wheel(self, package):
+        """
+        For a given package name, returns a link to the download URL,
+        else returns None.
+
+        Related: https://github.com/Miserlou/Zappa/issues/398
+        Examples here: https://gist.github.com/perrygeo/9545f94eaddec18a65fd7b56880adbae
+        """
+        url = 'https://pypi.python.org/pypi/{}/json'.format(package)
+        try:
+            res = requests.get(url, timeout=1.5)
+            data = res.json()
+            version = data['info']['version']
+            for f in data['releases'][version]:
+                if f['filename'].endswith('cp27mu-manylinux1_x86_64.whl'):
+                    return f['url']
+        except Exception, e: # pragma: no cover
+            return None
+        return None
 
     ##
     # S3
     ##
 
     def upload_to_s3(self, source_path, bucket_name):
-        """
+        r"""
         Given a file, upload it to S3.
         Credentials should be stored in environment variables or ~/.aws/credentials (%USERPROFILE%\.aws\credentials on Windows).
 
         Returns True on success, false on failure.
 
         """
-
-        # If this bucket doesn't exist, make it.
-        # Will likely fail, but that's apparently the best way to check
-        # it exists, since boto3 doesn't expose a better check.
         try:
-
+            self.s3_client.head_bucket(Bucket=bucket_name)
+        except botocore.exceptions.ClientError:
             # This is really stupid S3 quirk. Technically, us-east-1 one has no S3,
             # it's actually "US Standard", or something.
             # More here: https://github.com/boto/boto3/issues/125
             if self.aws_region == 'us-east-1':
-                self.s3.create_bucket(
+                self.s3_client.create_bucket(
                     Bucket=bucket_name,
                 )
             else:
-                self.s3.create_bucket(
+                self.s3_client.create_bucket(
                     Bucket=bucket_name,
                     CreateBucketConfiguration={'LocationConstraint': self.aws_region},
                 )
-        except botocore.exceptions.ClientError as e: # pragma: no cover
-            pass
 
         if not os.path.isfile(source_path) or os.stat(source_path).st_size == 0:
             print("Problem with source file {}".format(source_path))
@@ -470,7 +572,7 @@ class Zappa(object):
         dest_path = os.path.split(source_path)[1]
         try:
             source_size = os.stat(source_path).st_size
-            print("Uploading zip (" + str(self.human_size(source_size)) + ")...")
+            print("Uploading {0} ({1})..".format(dest_path, self.human_size(source_size)))
             progress = tqdm(total=float(os.path.getsize(source_path)), unit_scale=True, unit='B')
 
             # Attempt to upload to S3 using the S3 meta client with the progress bar.
@@ -478,17 +580,17 @@ class Zappa(object):
             # which cannot use the progress bar.
             # Related: https://github.com/boto/boto3/issues/611
             try:
-                self.s3.meta.client.upload_file(
+                self.s3_client.upload_file(
                     source_path, bucket_name, dest_path,
                     Callback=progress.update
                 )
-            except Exception as e: # pragma: no cover
+            except Exception as e:  # pragma: no cover
                 self.s3_client.upload_file(source_path, bucket_name, dest_path)
 
             progress.close()
-        except (KeyboardInterrupt, SystemExit): # pragma: no cover
+        except (KeyboardInterrupt, SystemExit):  # pragma: no cover
             raise
-        except Exception as e: # pragma: no cover
+        except Exception as e:  # pragma: no cover
             print(e)
             return False
         return True
@@ -502,33 +604,30 @@ class Zappa(object):
         Returns True on success, False on failure.
 
         """
-        bucket = self.s3.Bucket(bucket_name)
-
         try:
-            self.s3.meta.client.head_bucket(Bucket=bucket_name)
-        except botocore.exceptions.ClientError as e: # pragma: no cover
+            self.s3_client.head_bucket(Bucket=bucket_name)
+        except botocore.exceptions.ClientError as e:  # pragma: no cover
             # If a client error is thrown, then check that it was a 404 error.
             # If it was a 404 error, then the bucket does not exist.
             error_code = int(e.response['Error']['Code'])
             if error_code == 404:
                 return False
 
-        delete_keys = {'Objects': [{'Key': file_name}]}
-        response = bucket.delete_objects(Delete=delete_keys)
-        if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        try:
+            self.s3_client.delete_object(Bucket=bucket_name, Key=file_name)
             return True
-        else: # pragma: no cover
+        except botocore.exceptions.ClientError:  # pragma: no cover
             return False
+
     ##
     # Lambda
     ##
 
-    def create_lambda_function(self, bucket, s3_key, function_name, handler, description="Zappa Deployment", timeout=30, memory_size=512, publish=True, vpc_config=None):
+    def create_lambda_function(self, bucket, s3_key, function_name, handler, description="Zappa Deployment",
+                               timeout=30, memory_size=512, publish=True, vpc_config=None):
         """
         Given a bucket and key of a valid Lambda-zip, a function name and a handler, register that Lambda function.
-
         """
-
         if not vpc_config:
             vpc_config = {}
         if not self.credentials_arn:
@@ -555,9 +654,7 @@ class Zappa(object):
     def update_lambda_function(self, bucket, s3_key, function_name, publish=True):
         """
         Given a bucket and key of a valid Lambda-zip, a function name and a handler, update that Lambda function's code.
-
         """
-
         print("Updating Lambda function code..")
 
         response = self.lambda_client.update_function_code(
@@ -569,12 +666,11 @@ class Zappa(object):
 
         return response['FunctionArn']
 
-    def update_lambda_configuration(self, lambda_arn, function_name, handler, description="Zappa Deployment", timeout=30, memory_size=512, publish=True, vpc_config=None):
+    def update_lambda_configuration(self, lambda_arn, function_name, handler, description="Zappa Deployment",
+                                    timeout=30, memory_size=512, publish=True, vpc_config=None):
         """
         Given an existing function ARN, update the configuration variables.
-
         """
-
         print("Updating Lambda function configuration..")
 
         if not vpc_config:
@@ -595,13 +691,12 @@ class Zappa(object):
 
         return response['FunctionArn']
 
-    def invoke_lambda_function(self, function_name, payload, invocation_type='Event', log_type='Tail', client_context=None, qualifier=None):
+    def invoke_lambda_function(self, function_name, payload, invocation_type='Event', log_type='Tail',
+                               client_context=None, qualifier=None):
         """
         Directly invoke a named Lambda function with a payload.
         Returns the response.
-
         """
-
         return self.lambda_client.invoke(
             FunctionName=function_name,
             InvocationType=invocation_type,
@@ -609,17 +704,15 @@ class Zappa(object):
             Payload=payload
         )
 
-
     def rollback_lambda_function_version(self, function_name, versions_back=1, publish=True):
         """
         Rollback the lambda function code 'versions_back' number of revisions.
 
         Returns the Function ARN.
-
         """
         response = self.lambda_client.list_versions_by_function(FunctionName=function_name)
 
-        #Take into account $LATEST
+        # Take into account $LATEST
         if len(response['Versions']) < versions_back + 1:
             print("We do not have {} revisions. Aborting".format(str(versions_back)))
             return False
@@ -634,7 +727,7 @@ class Zappa(object):
             print("Failed to get version {} of {} code".format(versions_back, function_name))
             return False
 
-        response = self.lambda_client.update_function_code(FunctionName=function_name, ZipFile=response.content, Publish=publish) # pragma: no cover
+        response = self.lambda_client.update_function_code(FunctionName=function_name, ZipFile=response.content, Publish=publish)  # pragma: no cover
 
         return response['FunctionArn']
 
@@ -646,7 +739,7 @@ class Zappa(object):
         try:
             response = self.lambda_client.list_versions_by_function(FunctionName=function_name)
             return response.get('Versions', [])
-        except Exception as e:
+        except Exception:
             return []
 
     def delete_lambda_function(self, function_name):
@@ -667,186 +760,243 @@ class Zappa(object):
     ##
 
     def create_api_gateway_routes(self, lambda_arn, api_name=None, api_key_required=False,
-                                  integration_content_type_aliases=None):
+                                  integration_content_type_aliases=None, authorization_type='NONE', authorizer=None, cors_options=None):
         """
-        Creates the API Gateway for this Zappa deployment.
+        Create the API Gateway for this Zappa deployment.
 
-        Returns the new API's api_id.
-
+        Returns the new RestAPI CF resource.
         """
 
-        print("Creating API Gateway routes (this only happens once)..")
+        restapi = troposphere.apigateway.RestApi('Api')
+        restapi.Name = api_name or lambda_arn.split(':')[-1]
+        restapi.Description = 'Created automatically by Zappa.'
+        self.cf_template.add_resource(restapi)
 
-        if not api_name:
-            api_name = str(int(time.time()))
-
-        # Does an API Gateway with this name exist already?
-        apis = self.apigateway_client.get_rest_apis()['items']
-        if not len(filter(lambda a: a['name'] == api_name, apis)):
-            response = self.apigateway_client.create_rest_api(
-                name=api_name,
-                description=api_name + " Zappa",
-                cloneFrom=''
-            )
-
-        api_id = response['id']
+        root_id = troposphere.GetAtt(restapi, 'RootResourceId')
+        invocations_uri = 'arn:aws:apigateway:' + self.boto_session.region_name + ':lambda:path/2015-03-31/functions/' + lambda_arn + '/invocations'
 
         ##
         # The Resources
         ##
+        authorizer_resource = None
+        if authorizer:
+            authorizer_lambda_arn = authorizer.get('arn', lambda_arn)
+            lambda_uri = 'arn:aws:apigateway:' + self.boto_session.region_name + ':lambda:path/2015-03-31/functions/' + authorizer_lambda_arn + '/invocations'
 
-        response = self.apigateway_client.get_resources(restApiId=api_id)
+            authorizer_resource = self.create_authorizer(restapi,
+                                                         lambda_uri,
+                                                         "method.request.header." + authorizer.get('token_header', 'Authorization'),
+                                                         authorizer.get('result_ttl', 300),
+                                                         authorizer.get('validation_expression', None))
 
-        # count how many put requests we'll be reporting for progress bar
-        progress_total = self.parameter_depth * len(self.http_methods) * (
-                             2 + len(self.integration_response_codes) + len(self.method_response_codes))
-        progress = tqdm(total=progress_total, unit=' endpoint')
+        self.create_and_setup_methods(restapi, root_id, api_key_required, invocations_uri,
+                                      integration_content_type_aliases, authorization_type, authorizer_resource, 0)
 
-        # AWS seems to create this by default,
-        # but not sure if that'll be the case forever.
-        parent_id = None
-        for item in response['items']:
-            if item['path'] == '/':
-                root_id = item['id']
-        if not root_id: # pragma: no cover
-            return False
-        self.create_and_setup_methods(api_id, root_id, lambda_arn, progress.update, api_key_required,
-                                      integration_content_type_aliases)
+        if cors_options is not None:
+            self.create_and_setup_cors(restapi, root_id, invocations_uri, 0, cors_options)
 
-        parent_id = root_id
-        for i in range(1, self.parameter_depth):
+        resource = troposphere.apigateway.Resource('ResourceAnyPathSlashed')
+        self.cf_api_resources.append(resource.title)
+        resource.RestApiId = troposphere.Ref(restapi)
+        resource.ParentId = root_id
+        resource.PathPart = "{proxy+}"
+        self.cf_template.add_resource(resource)
 
-            response = self.apigateway_client.create_resource(
-                restApiId=api_id,
-                parentId=parent_id,
-                pathPart="{parameter_" + str(i) + "}"
-            )
-            resource_id = response['id']
-            parent_id = resource_id
+        self.create_and_setup_methods(restapi, resource, api_key_required, invocations_uri,
+                                      integration_content_type_aliases, authorization_type, authorizer_resource, 1)  # pragma: no cover
 
-            self.create_and_setup_methods(api_id, resource_id, lambda_arn, progress.update, api_key_required,
-                                          integration_content_type_aliases) # pragma: no cover
+        if cors_options is not None:
+            self.create_and_setup_cors(restapi, resource, invocations_uri, 1, cors_options)  # pragma: no cover
+        return restapi
 
-        return api_id
-
-    def create_and_setup_methods(self, api_id, resource_id, lambda_arn, report_progress, api_key_required,
-                                 integration_content_type_aliases):
+    def create_authorizer(self, restapi, uri, identity_source, authorizer_result_ttl, identity_validation_expression):
         """
-        Sets up the methods, integration responses and method responses for a given API Gateway resource.
-
-        Returns the given API's resource_id.
-
+        Create Authorizer for API gateway
         """
-        for method in self.http_methods:
-            response = self.apigateway_client.put_method(
-                    restApiId=api_id,
-                    resourceId=resource_id,
-                    httpMethod=method,
-                    authorizationType='none',
-                    apiKeyRequired=api_key_required
-            )
-            report_progress()
+        if not self.credentials_arn:
+            self.get_credentials_arn()
 
-            post_template_mapping = POST_TEMPLATE_MAPPING
-            form_encoded_template_mapping = FORM_ENCODED_TEMPLATE_MAPPING
-            content_mapping_templates = {
-                'application/json': post_template_mapping,
-                'application/x-www-form-urlencoded': post_template_mapping,
-                'multipart/form-data': form_encoded_template_mapping
-            }
-            if integration_content_type_aliases:
-                for content_type in content_mapping_templates.keys():
-                    aliases = integration_content_type_aliases.get(content_type, [])
-                    for alias in aliases:
-                        content_mapping_templates[alias] = content_mapping_templates[content_type]
+        authorizer_resource = troposphere.apigateway.Authorizer("Authorizer")
+        authorizer_resource.RestApiId = troposphere.Ref(restapi)
+        authorizer_resource.Name = "ZappaAuthorizer"
+        authorizer_resource.Type = 'TOKEN'
+        authorizer_resource.AuthorizerResultTtlInSeconds = authorizer_result_ttl
+        authorizer_resource.AuthorizerUri = uri
+        authorizer_resource.IdentitySource = identity_source
+        authorizer_resource.AuthorizerCredentials = self.credentials_arn
+        if identity_validation_expression:
+            authorizer_resource.IdentityValidationExpression = identity_validation_expression
+
+        self.cf_api_resources.append(authorizer_resource.title)
+        self.cf_template.add_resource(authorizer_resource)
+
+        return authorizer_resource
+
+    def create_and_setup_methods(self, restapi, resource, api_key_required, uri,
+                                 integration_content_type_aliases, authorization_type, authorizer_resource, depth):
+        """
+        Set up the methods, integration responses and method responses for a given API Gateway resource.
+        """
+        for method_name in self.http_methods:
+            method = troposphere.apigateway.Method(method_name + str(depth))
+            method.RestApiId = troposphere.Ref(restapi)
+            if type(resource) is troposphere.apigateway.Resource:
+                method.ResourceId = troposphere.Ref(resource)
+            else:
+                method.ResourceId = resource
+            method.HttpMethod = method_name.upper()
+            method.AuthorizationType = authorization_type
+            if authorizer_resource:
+                method.AuthorizerId = troposphere.Ref(authorizer_resource)
+            method.ApiKeyRequired = api_key_required
+            method.MethodResponses = []
+            self.cf_template.add_resource(method)
+            self.cf_api_resources.append(method.title)
+
+            # content_mapping_templates = {
+            #     'application/json': self.cache_param(POST_TEMPLATE_MAPPING),
+            #     'application/x-www-form-urlencoded': self.cache_param(POST_TEMPLATE_MAPPING),
+            #     'multipart/form-data': self.cache_param(FORM_ENCODED_TEMPLATE_MAPPING)
+            # }
+            # if integration_content_type_aliases:
+            #     for content_type in content_mapping_templates.keys():
+            #         aliases = integration_content_type_aliases.get(content_type, [])
+            #         for alias in aliases:
+            #             content_mapping_templates[alias] = self.cache_param(content_mapping_templates[content_type])
 
             if not self.credentials_arn:
                 self.get_credentials_arn()
             credentials = self.credentials_arn  # This must be a Role ARN
 
-            uri = 'arn:aws:apigateway:' + self.boto_session.region_name + ':lambda:path/2015-03-31/functions/' + lambda_arn + '/invocations'
-
-            self.apigateway_client.put_integration(
-                restApiId=api_id,
-                resourceId=resource_id,
-                httpMethod=method.upper(),
-                type='AWS',
-                integrationHttpMethod='POST',
-                uri=uri,
-                credentials=credentials,
-                requestParameters={},
-                requestTemplates=content_mapping_templates,
-                cacheNamespace='none',
-                passthroughBehavior='NEVER',
-                cacheKeyParameters=[],
-            )
-            report_progress()
+            integration = troposphere.apigateway.Integration()
+            integration.CacheKeyParameters = []
+            integration.CacheNamespace = 'none'
+            integration.Credentials = credentials
+            integration.IntegrationHttpMethod = 'POST'
+            integration.IntegrationResponses = []
+            integration.PassthroughBehavior = 'NEVER'
+            # integration.RequestParameters = {}
+            # integration.RequestTemplates = content_mapping_templates
+            integration.Type = 'AWS_PROXY'
+            integration.Uri = uri
+            method.Integration = integration
 
             ##
             # Method Response
             ##
 
-            for response in self.method_response_codes:
-                status_code = str(response)
+            # for response_code in self.method_response_codes:
+            #     status_code = str(response_code)
 
-                response_parameters = {"method.response.header." + header_type: False for header_type in self.method_header_types}
-                response_models = {content_type: 'Empty' for content_type in self.method_content_types}
+            #     response_parameters = {"method.response.header." + header_type: False for header_type in self.method_header_types}
+            #     response_models = {content_type: 'Empty' for content_type in self.method_content_types}
 
-                method_response = self.apigateway_client.put_method_response(
-                        restApiId=api_id,
-                        resourceId=resource_id,
-                        httpMethod=method,
-                        statusCode=status_code,
-                        responseParameters=response_parameters,
-                        responseModels=response_models
-                )
-                report_progress()
+            #     response = troposphere.apigateway.MethodResponse()
+            #     response.ResponseModels = response_models
+            #     response.ResponseParameters = response_parameters
+            #     response.StatusCode = status_code
+            #     method.MethodResponses.append(response)
 
             ##
             # Integration Response
             ##
 
-            for response in self.integration_response_codes:
-                status_code = str(response)
+            # for response in self.integration_response_codes:
+            #     status_code = str(response)
 
-                response_parameters = {"method.response.header." + header_type: "integration.response.body." + header_type for header_type in self.method_header_types}
+            #     response_parameters = {
+            #         "method.response.header." + header_type: self.cache_param("integration.response.body." + header_type)
+            #         for header_type in self.method_header_types}
 
-                # Error code matching RegEx
-                # Thanks to @KevinHornschemeier and @jayway
-                # for the discussion on this.
-                if status_code == '200':
-                    response_templates = {content_type: RESPONSE_TEMPLATE for content_type in self.integration_content_types}
-                elif status_code in ['301', '302']:
-                    response_templates = {content_type: REDIRECT_RESPONSE_TEMPLATE for content_type in self.integration_content_types}
-                    response_parameters["method.response.header.Location"] = "integration.response.body.errorMessage"
-                else:
-                    response_templates = {content_type: ERROR_RESPONSE_TEMPLATE for content_type in self.integration_content_types}
+            #     # Error code matching RegEx
+            #     # Thanks to @KevinHornschemeier and @jayway
+            #     # for the discussion on this.
+            #     if status_code == '200':
+            #         response_templates = {content_type: self.cache_param(RESPONSE_TEMPLATE) for content_type in self.integration_content_types}
+            #     elif status_code in ['301', '302']:
+            #         response_templates = {content_type: REDIRECT_RESPONSE_TEMPLATE for content_type in self.integration_content_types}
+            #         response_parameters["method.response.header.Location"] = self.cache_param("integration.response.body.errorMessage")
+            #     else:
+            #         response_templates = {content_type: self.cache_param(ERROR_RESPONSE_TEMPLATE) for content_type in self.integration_content_types}
 
-                integration_response = self.apigateway_client.put_integration_response(
-                        restApiId=api_id,
-                        resourceId=resource_id,
-                        httpMethod=method,
-                        statusCode=status_code,
-                        selectionPattern=self.selection_pattern(status_code),
-                        responseParameters=response_parameters,
-                        responseTemplates=response_templates
-                )
-                report_progress()
+            #     integration_response = troposphere.apigateway.IntegrationResponse()
+            #     integration_response.ResponseParameters = response_parameters
+            #     integration_response.ResponseTemplates = response_templates
+            #     integration_response.SelectionPattern = self.selection_pattern(status_code)
+            #     integration_response.StatusCode = status_code
+            #     integration.IntegrationResponses.append(integration_response)
 
-        return resource_id
+    def create_and_setup_cors(self, restapi, resource, uri, depth, config):
+        """
+        Set up the methods, integration responses and method responses for a given API Gateway resource.
+        """
+        if config is True:
+            config = {}
+        method_name = "OPTIONS"
+        method = troposphere.apigateway.Method(method_name + str(depth))
+        method.RestApiId = troposphere.Ref(restapi)
+        if type(resource) is troposphere.apigateway.Resource:
+            method.ResourceId = troposphere.Ref(resource)
+        else:
+            method.ResourceId = resource
+        method.HttpMethod = method_name.upper()
+        method.AuthorizationType = "NONE"
+        method_response = troposphere.apigateway.MethodResponse()
+        method_response.ResponseModels = {
+            "application/json": "Empty"
+        }
+        response_headers = {
+            "Access-Control-Allow-Headers": "'%s'" % ",".join(config.get(
+                "allowed_headers", ["Content-Type", "X-Amz-Date",
+                                    "Authorization", "X-Api-Key",
+                                    "X-Amz-Security-Token"])),
+            "Access-Control-Allow-Methods": "'%s'" % ",".join(config.get(
+                "allowed_methods", ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"])),
+            "Access-Control-Allow-Origin": "'%s'" % config.get(
+                "allowed_origin", "*")
+        }
+        method_response.ResponseParameters = {
+            "method.response.header.%s" % key: True for key in response_headers
+        }
+        method_response.StatusCode = "200"
+        method.MethodResponses = [
+            method_response
+        ]
+        self.cf_template.add_resource(method)
+        self.cf_api_resources.append(method.title)
 
-    def deploy_api_gateway(self, api_id, stage_name, stage_description="", description="", cache_cluster_enabled=False, cache_cluster_size='0.5', variables=None,
-            cloudwatch_log_level='OFF', cloudwatch_data_trace=False, cloudwatch_metrics_enabled=False):
+        integration = troposphere.apigateway.Integration()
+        integration.Type = 'MOCK'
+        integration.PassthroughBehavior = 'NEVER'
+        integration.RequestTemplates = {
+            "application/json": "{\"statusCode\": 200}"
+        }
+        integration_response = troposphere.apigateway.IntegrationResponse()
+        integration_response.ResponseParameters = {
+            "method.response.header.%s" % key: value for key, value in response_headers.items()
+        }
+        integration_response.ResponseTemplates = {
+            "application/json": ""
+        }
+        integration_response.StatusCode = "200"
+        integration.IntegrationResponses = [
+            integration_response
+        ]
+
+        integration.Uri = uri
+        method.Integration = integration
+
+    def deploy_api_gateway(self, api_id, stage_name, stage_description="", description="", cache_cluster_enabled=False,
+                           cache_cluster_size='0.5', variables=None, cloudwatch_log_level='OFF',
+                           cloudwatch_data_trace=False, cloudwatch_metrics_enabled=False):
         """
         Deploy the API Gateway!
 
-        Returns the deployed API URL.
-
+        Return the deployed API URL.
         """
-
         print("Deploying API Gateway..")
 
-        response = self.apigateway_client.create_deployment(
+        self.apigateway_client.create_deployment(
             restApiId=api_id,
             stageName=stage_name,
             stageDescription=stage_description,
@@ -907,7 +1057,7 @@ class Zappa(object):
             nameQuery='{}_{}'.format(stage_name, api_id)
         )
         for api_key in response.get('items'):
-            resp = self.apigateway_client.delete_api_key(
+            self.apigateway_client.delete_api_key(
                 apiKey="{}".format(api_key['id'])
             )
 
@@ -928,9 +1078,8 @@ class Zappa(object):
 
     def get_patch_op(self, keypath, value, op='replace'):
         """
-        Returns an object that describes a change of configuration on the given staging.
+        Return an object that describes a change of configuration on the given staging.
         Setting will be applied on all available HTTP methods.
-
         """
         if isinstance(value, bool):
             value = str(value).lower()
@@ -949,36 +1098,42 @@ class Zappa(object):
                 continue
             yield api
 
-    def undeploy_api_gateway(self, project_name, domain_name=None):
+    def undeploy_api_gateway(self, lambda_name, domain_name=None):
         """
         Delete a deployed REST API Gateway.
-
         """
-
         print("Deleting API Gateway..")
-        for api in self.get_rest_apis(project_name):
 
-            if domain_name:
-                try:
-                    self.apigateway_client.delete_base_path_mapping(
-                        domainName=domain_name,
-                        basePath='(none)'
-                    )
-                except Exception as e:
-                    # We may not have actually set up the domain.
-                    pass
+        api_id = self.get_api_id(lambda_name)
 
-            self.apigateway_client.delete_rest_api(
+        if domain_name:
+
+            # XXX - Remove Route53 smartly here?
+            # XXX - This doesn't raise, but doesn't work either.
+
+            try:
+                self.apigateway_client.delete_base_path_mapping(
+                    domainName=domain_name,
+                    basePath='(none)'
+                )
+            except Exception as e:
+                # We may not have actually set up the domain.
+                pass
+
+        was_deleted = self.delete_stack(lambda_name, wait=True)
+
+        if not was_deleted:
+            # try erasing it with the older method
+            for api in self.get_rest_apis(lambda_name):
+                self.apigateway_client.delete_rest_api(
                     restApiId=api['id']
-            )
+                )
 
     def update_stage_config(self, project_name, stage_name, cloudwatch_log_level, cloudwatch_data_trace,
-        cloudwatch_metrics_enabled):
+                            cloudwatch_metrics_enabled):
         """
         Update CloudWatch metrics configuration.
-
         """
-
         if cloudwatch_log_level not in self.cloudwatch_log_levels:
             cloudwatch_log_level = 'OFF'
 
@@ -993,41 +1148,200 @@ class Zappa(object):
                 ]
             )
 
-    def get_api_url(self, project_name, stage_name):
+    def delete_stack(self, name, wait=False):
         """
-        Given a project_name and stage_name, return a valid API URL.
+        Delete the CF stack managed by Zappa.
+        """
+        try:
+            stack = self.cf_client.describe_stacks(StackName=name)['Stacks'][0]
+        except: # pragma: no cover
+            print('No Zappa stack named {0}'.format(name))
+            return False
 
+        tags = {x['Key']:x['Value'] for x in stack['Tags']}
+        if tags.get('ZappaProject') == name:
+            self.cf_client.delete_stack(StackName=name)
+            if wait:
+                waiter = self.cf_client.get_waiter('stack_delete_complete')
+                print('Waiting for stack {0} to be deleted..'.format(name))
+                waiter.wait(StackName=name)
+            return True
+        else:
+            print('ZappaProject tag not found on {0}, doing nothing'.format(name))
+            return False
+
+    def create_stack_template(self, lambda_arn, lambda_name, api_key_required, integration_content_type_aliases,
+                              iam_authorization, authorizer, cors_options=None):
+        """
+        Build the entire CF stack.
+        Just used for the API Gateway, but could be expanded in the future.
         """
 
-        response = self.apigateway_client.get_rest_apis(limit=500)
+        auth_type = "NONE"
+        if iam_authorization and authorizer:
+            logger.warn("Both IAM Authorization and Authorizer are specified, this is not possible. "
+                        "Setting Auth method to IAM Authorization")
+            authorizer = None
+            auth_type = "AWS_IAM"
+        elif iam_authorization:
+            auth_type = "AWS_IAM"
+        elif authorizer:
+            auth_type = "CUSTOM"
 
-        for item in response['items']:
-            if item['name'] == project_name:
-                return "https://{}.execute-api.{}.amazonaws.com/{}".format(item['id'], self.boto_session.region_name, stage_name)
+        # build a fresh template
+        self.cf_template = troposphere.Template()
+        self.cf_template.add_description('Automatically generated with Zappa')
+        self.cf_api_resources = []
+        self.cf_parameters = {}
 
-        return None
+        restapi = self.create_api_gateway_routes(lambda_arn, lambda_name, api_key_required,
+                                                 integration_content_type_aliases, auth_type, authorizer, cors_options)
+        return self.cf_template
 
-    def get_api_id(self, project_name):
+    def update_stack(self, name, working_bucket, wait=False, update_only=False):
         """
-        Given a project_name, return the API id.
+        Update or create the CF stack managed by Zappa.
         """
-        response = self.apigateway_client.get_rest_apis(limit=500)
+        capabilities = []
 
-        for item in response['items']:
-            if item['name'] == project_name:
-                return item['id']
+        template = name + '-template-' + str(int(time.time())) + '.json'
+        with open(template, 'w') as out:
+            out.write(self.cf_template.to_json(indent=None, separators=(',',':')))
 
-        return None
+        self.upload_to_s3(template, working_bucket)
 
-    def create_domain_name( self,
-                            domain_name,
-                            certificate_name,
-                            certificate_body,
-                            certificate_private_key,
-                            certificate_chain,
-                            lambda_name,
-                            stage,
-                        ):
+        url = 'https://s3.amazonaws.com/{0}/{1}'.format(working_bucket, template)
+        tags = [{'Key':'ZappaProject','Value':name}]
+        update = True
+
+        try:
+            self.cf_client.describe_stacks(StackName=name)
+        except botocore.client.ClientError:
+            update = False
+
+        if update_only and not update:
+            print('CloudFormation stack missing, re-deploy to enable updates')
+            return
+
+        if not update:
+            self.cf_client.create_stack(StackName=name,
+                                        Capabilities=capabilities,
+                                        TemplateURL=url,
+                                        Tags=tags)
+            print('Waiting for stack {0} to create (this can take a bit)..'.format(name))
+        else:
+            try:
+                self.cf_client.update_stack(StackName=name,
+                                            Capabilities=capabilities,
+                                            TemplateURL=url,
+                                            Tags=tags)
+                print('Waiting for stack {0} to update..'.format(name))
+            except botocore.client.ClientError as e:
+                if e.response['Error']['Message'] == 'No updates are to be performed.':
+                    wait = False
+                else:
+                    raise
+
+        if wait:
+            total_resources = len(self.cf_template.resources)
+            current_resources = 0
+            sr = self.cf_client.get_paginator('list_stack_resources')
+            progress = tqdm(total=total_resources, unit='res')
+            while True:
+                time.sleep(3)
+                result = self.cf_client.describe_stacks(StackName=name)
+                if not result['Stacks']:
+                    continue  # might need to wait a bit
+
+                if result['Stacks'][0]['StackStatus'] in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
+                    break
+
+                # Something has gone wrong.
+                # Is raising enough? Should we also remove the Lambda function?
+                if result['Stacks'][0]['StackStatus'] in [
+                                                            'DELETE_COMPLETE',
+                                                            'DELETE_IN_PROGRESS',
+                                                            'ROLLBACK_IN_PROGRESS',
+                                                            'UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS',
+                                                            'UPDATE_ROLLBACK_COMPLETE'
+                                                        ]:
+                    raise EnvironmentError("Stack creation failed. "
+                                           "Please check your CloudFormation console. "
+                                           "You may also need to `undeploy`.")
+
+                count = 0
+                for result in sr.paginate(StackName=name):
+                    done = (1 for x in result['StackResourceSummaries']
+                            if 'COMPLETE' in x['ResourceStatus'])
+                    count += sum(done)
+                if count:
+                    # We can end up in a situation where we have more resources being created
+                    # than anticipated.
+                    if (count - current_resources) > 0:
+                        progress.update(count - current_resources)
+                current_resources = count
+            progress.close()
+
+        try:
+            os.remove(template)
+        except OSError:
+            pass
+
+        self.remove_from_s3(template, working_bucket)
+
+    def stack_outputs(self, name):
+        """
+        Given a name, describes CloudFront stacks and returns dict of the stack Outputs
+        , else returns an empty dict.
+        """
+        try:
+            stack = self.cf_client.describe_stacks(StackName=name)['Stacks'][0]
+            return {x['OutputKey']: x['OutputValue'] for x in stack['Outputs']}
+        except botocore.client.ClientError:
+            return {}
+
+
+    def get_api_url(self, lambda_name, stage_name):
+        """
+        Given a lambda_name and stage_name, return a valid API URL.
+        """
+        api_id = self.get_api_id(lambda_name)
+        if api_id:
+            return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
+        else:
+            return None
+
+    def get_api_id(self, lambda_name):
+        """
+        Given a lambda_name, return the API id.
+        """
+        try:
+            response = self.cf_client.describe_stack_resource(StackName=lambda_name,
+                                                              LogicalResourceId='Api')
+            return response['StackResourceDetail'].get('PhysicalResourceId', None)
+        except: # pragma: no cover
+            try:
+                # Try the old method (project was probably made on an older, non CF version)
+                response = self.apigateway_client.get_rest_apis(limit=500)
+
+                for item in response['items']:
+                    if item['name'] == lambda_name:
+                        return item['id']
+
+                logger.exception('Could not get API ID.')
+                return None
+            except: # pragma: no cover
+                # We don't even have an API deployed. That's okay!
+                return None
+
+    def create_domain_name(self,
+                           domain_name,
+                           certificate_name,
+                           certificate_body,
+                           certificate_private_key,
+                           certificate_chain,
+                           lambda_name,
+                           stage):
         """
         Great the API GW domain.
         """
@@ -1054,28 +1368,44 @@ class Zappa(object):
             stage=stage
         )
 
+        is_apex = self.route53.get_hosted_zone(Id=zone_id)['HostedZone']['Name'][:-1] == domain_name
+        if is_apex:
+            record_set = {
+                'Name': domain_name,
+                'Type': 'A',
+                'AliasTarget': {
+                    'HostedZoneId': 'Z2FDTNDATAQYW2',
+                    'DNSName': dns_name,
+                    'EvaluateTargetHealth': False
+                }
+            }
+        else:
+            record_set = {
+                'Name': domain_name,
+                'Type': 'CNAME',
+                'ResourceRecords': [
+                    {
+                        'Value': dns_name
+                    }
+                ],
+                'TTL': 60
+            }
+
         # Related: https://github.com/boto/boto3/issues/157
         # and: http://docs.aws.amazon.com/Route53/latest/APIReference/CreateAliasRRSAPI.html
         # and policy: https://spin.atomicobject.com/2016/04/28/route-53-hosted-zone-managment/
-        pure_zone_id = zone_id.split('/hostedzone/')[1]
+        # pure_zone_id = zone_id.split('/hostedzone/')[1]
 
-        # XXX: ClientError: An error occurred (InvalidChangeBatch) when calling the ChangeResourceRecordSets operation: Tried to create an alias that targets d1awfeji80d0k2.cloudfront.net., type A in zone Z1XWOQP59BYF6Z, but the alias target name does not lie within the target zone
+        # XXX: ClientError: An error occurred (InvalidChangeBatch) when calling the ChangeResourceRecordSets operation:
+        # Tried to create an alias that targets d1awfeji80d0k2.cloudfront.net., type A in zone Z1XWOQP59BYF6Z,
+        # but the alias target name does not lie within the target zone
         response = self.route53.change_resource_record_sets(
             HostedZoneId=zone_id,
             ChangeBatch={
                 'Changes': [
                     {
                         'Action': 'UPSERT',
-                        'ResourceRecordSet': {
-                            'Name': domain_name,
-                            'Type': 'CNAME',
-                            'ResourceRecords': [
-                                {
-                                    'Value': dns_name
-                                }
-                            ],
-                            'TTL': 60
-                        }
+                        'ResourceRecordSet': record_set
                     }
                 ]
             }
@@ -1083,28 +1413,29 @@ class Zappa(object):
 
         return response
 
-    def update_domain_name( self,
-                            domain_name,
-                            certificate_name,
-                            certificate_body,
-                            certificate_private_key,
-                            certificate_chain,
-                        ):
+    def update_domain_name(self,
+                           domain_name,
+                           certificate_name,
+                           certificate_body,
+                           certificate_private_key,
+                           certificate_chain):
         """
         Update an IAM server cert and AGW domain name with it.
         """
-
         # Patch operations described here: https://tools.ietf.org/html/rfc6902#section-4
         # and here: http://boto3.readthedocs.io/en/latest/reference/services/apigateway.html#APIGateway.Client.update_domain_name
 
-        new_cert_name = 'LEZappa' + str(time.time())
-        server_certificate = self.iam.create_server_certificate(
+
+        print("Updating domain name!")
+
+        new_cert_name = 'Zappa' + str(time.time())
+        create_server_certificate_response = self.iam.create_server_certificate(
             ServerCertificateName=new_cert_name,
             CertificateBody=certificate_body,
             PrivateKey=certificate_private_key,
             CertificateChain=certificate_chain
         )
-        response = self.apigateway_client.update_domain_name(
+        update_domain_name_response = self.apigateway_client.update_domain_name(
             domainName=domain_name,
             patchOperations=[
                 {
@@ -1119,14 +1450,43 @@ class Zappa(object):
 
     def get_domain_name(self, domain_name):
         """
+        Scan our hosted zones for the record of a given name.
+
+        Returns the record entry, else None.
+
         """
+        # make sure api gateway domain is present
         try:
-            response = self.apigateway_client.get_domain_name(
-                domainName=domain_name
-            )
-            return response
+            self.apigateway_client.get_domain_name(domainName=domain_name)
+        except Exception:
+            return None
+
+        try:
+            zones = self.route53.list_hosted_zones()
+            for zone in zones['HostedZones']:
+                records = self.route53.list_resource_record_sets(HostedZoneId=zone['Id'])
+                for record in records['ResourceRecordSets']:
+                    if record['Type'] in ('CNAME', 'A') and record['Name'][:-1] == domain_name:
+                        return record
+
         except Exception as e:
             return None
+
+        ##
+        # Old, automatic logic.
+        # If re-introduced, should be moved to a new function.
+        # Related ticket: https://github.com/Miserlou/Zappa/pull/458
+        ##
+
+        # We may be in a position where Route53 doesn't have a domain, but the API Gateway does.
+        # We need to delete this before we can create the new Route53.
+        # try:
+        #     api_gateway_domain = self.apigateway_client.get_domain_name(domainName=domain_name)
+        #     self.apigateway_client.delete_domain_name(domainName=domain_name)
+        # except Exception:
+        #     pass
+
+        return None
 
     ##
     # IAM
@@ -1143,7 +1503,7 @@ class Zappa(object):
 
     def create_iam_roles(self):
         """
-        Creates and defines the IAM roles and policies necessary for Zappa.
+        Create and defines the IAM roles and policies necessary for Zappa.
 
         If the IAM role already exists, it will be updated if necessary.
         """
@@ -1156,10 +1516,12 @@ class Zappa(object):
             role, credentials_arn = self.get_credentials_arn()
 
         except botocore.client.ClientError:
-            print("Creating " + self.role_name + " IAM Role...")
+            print("Creating " + self.role_name + " IAM Role..")
 
-            role = self.iam.create_role(RoleName=self.role_name,
-                                   AssumeRolePolicyDocument=self.assume_policy)
+            role = self.iam.create_role(
+                RoleName=self.role_name,
+                AssumeRolePolicyDocument=self.assume_policy
+            )
             self.credentials_arn = role.arn
             updated = True
 
@@ -1196,9 +1558,7 @@ class Zappa(object):
         Create permissions to link to an event.
 
         Related: http://docs.aws.amazon.com/lambda/latest/dg/with-s3-example-configure-event-source.html
-
         """
-
         logger.debug('Adding new permission to invoke Lambda function: {}'.format(lambda_name))
         permission_response = self.lambda_client.add_permission(
             FunctionName=lambda_name,
@@ -1210,7 +1570,7 @@ class Zappa(object):
 
         if permission_response['ResponseMetadata']['HTTPStatusCode'] != 201:
             print('Problem creating permission to invoke Lambda function')
-            return None # XXX: Raise?
+            return None  # XXX: Raise?
 
         return permission_response
 
@@ -1223,14 +1583,21 @@ class Zappa(object):
 
         Expressions can be in rate or cron format:
             http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html
-
         """
+
+        # The two stream sources - DynamoDB and Kinesis - are working differently than the other services (pull vs push)
+        # and do not require event permissions. They do require additional permissions on the Lambda roles though.
+        # http://docs.aws.amazon.com/lambda/latest/dg/lambda-api-permissions-ref.html
+        pull_services = ['dynamodb', 'kinesis']
+
 
         # XXX: Not available in Lambda yet.
         # We probably want to execute the latest code.
         # if default:
         #     lambda_arn = lambda_arn + ":$LATEST"
-        self.unschedule_events(lambda_name=lambda_name, lambda_arn=lambda_arn, events=events)
+
+        self.unschedule_events(lambda_name=lambda_name, lambda_arn=lambda_arn, events=events,
+                               excluded_source_services=pull_services)
         for event in events:
             function = event['function']
             expression = event.get('expression', None)
@@ -1276,26 +1643,37 @@ class Zappa(object):
                 else:
                     print("Problem scheduling {}.".format(name))
 
-            else:
+            elif event_source:
+                service = self.service_from_arn(event_source['arn'])
 
-                svc = ','.join(event['event_source']['events'])
-                service = svc.split(':')[0]
-
-                self.create_event_permission(
-                                                lambda_name,
-                                                service + '.amazonaws.com',
-                                                event['event_source']['arn']
-                                            )
+                if service not in pull_services:
+                    svc = ','.join(event['event_source']['events'])
+                    self.create_event_permission(
+                        lambda_name,
+                        service + '.amazonaws.com',
+                        event['event_source']['arn']
+                    )
+                else:
+                    svc = service
 
                 rule_response = add_event_source(
-                                                    event_source,
-                                                    lambda_arn,
-                                                    function,
-                                                    self.boto_session
-                                                )
-                # # if rule_response: # Kappa doesn't give us this yet.
-                # So, we print as if was sucessful.
-                print("Created %s event schedule for %s!" % (svc, function))
+                    event_source,
+                    lambda_arn,
+                    function,
+                    self.boto_session
+                )
+
+                if rule_response == 'successful':
+                    print("Created {} event schedule for {}!".format(svc, function))
+                elif rule_response == 'failed':
+                    print("Problem creating {} event schedule for {}!".format(svc, function))
+                elif rule_response == 'exists':
+                    print("{} event schedule for {} already exists - Nothing to do here.".format(svc, function))
+                elif rule_response == 'dryrun':
+                    print("Dryrun for creating {} event schedule for {}!!".format(svc, function))
+            else:
+                print("Could not create event {} - Please define either an expression or an event source".format(name))
+
 
     @staticmethod
     def get_scheduled_event_name(event, function, lambda_name):
@@ -1309,7 +1687,11 @@ class Zappa(object):
 
     @staticmethod
     def get_event_name(lambda_name, name):
-        return '{}-{}'.format(lambda_name, name)
+        """
+        Returns an AWS-valid Lambda event name.
+
+        """
+        return '{prefix:.{width}}-{postfix}'.format(prefix=lambda_name, width=max(0, 63 - len(name)), postfix=name)[:64]
 
     def delete_rule(self, rule_name):
         """
@@ -1335,8 +1717,8 @@ class Zappa(object):
                 return
 
         if 'Targets' in targets and targets['Targets']:
-            response = self.events_client.remove_targets(Rule=rule_name, Ids=[x['Id'] for x in targets['Targets']])
-        else: # pragma: no cover
+            self.events_client.remove_targets(Rule=rule_name, Ids=[x['Id'] for x in targets['Targets']])
+        else:  # pragma: no cover
             logger.debug('No target to delete')
 
         # Delete our rule.
@@ -1349,8 +1731,8 @@ class Zappa(object):
         rules = [r['Name'] for r in self.events_client.list_rules(NamePrefix=lambda_name)['Rules']]
         return [self.events_client.describe_rule(Name=r) for r in rules]
 
-    def unschedule_events(self, events, lambda_arn=None, lambda_name=None):
-
+    def unschedule_events(self, events, lambda_arn=None, lambda_name=None, excluded_source_services=None):
+        excluded_source_services = excluded_source_services or []
         """
         Given a list of events, unschedule these CloudWatch Events.
 
@@ -1365,7 +1747,7 @@ class Zappa(object):
             self.delete_rule(rule_name)
             print('Unscheduled ' + rule_name + '.')
 
-        non_cwe = [e for e in events if e.has_key('event_source')]
+        non_cwe = [e for e in events if 'event_source' in e]
         for event in non_cwe:
             # TODO: This WILL miss non CW events that have been deployed but changed names. Figure out a way to remove
             # them no matter what.
@@ -1373,17 +1755,22 @@ class Zappa(object):
             function = event['function']
             name = event.get('name', function)
             event_source = event.get('event_source', function)
-            rule_response = remove_event_source(
-                                                event_source,
-                                                lambda_arn,
-                                                function,
-                                                self.boto_session
-                                            )
-            print("Removed event " + name + ".")
+            service = self.service_from_arn(event_source['arn'])
+            # DynamoDB and Kinesis streams take quite a while to setup after they are created and do not need to be
+            # re-scheduled when a new Lambda function is deployed. Therefore, they should not be removed during zappa
+            # update or zappa schedule.
+            if service not in excluded_source_services:
+                remove_event_source(
+                    event_source,
+                    lambda_arn,
+                    function,
+                    self.boto_session
+                )
+                print("Removed event " + name + ".")
 
     def _clear_policy(self, lambda_name):
         """
-        Removes obsolete policy statements to prevent policy from bloating over the limit after repeated updates.
+        Remove obsolete policy statements to prevent policy from bloating over the limit after repeated updates.
         """
         try:
             policy_response = self.lambda_client.get_policy(
@@ -1406,7 +1793,6 @@ class Zappa(object):
             else:
                 logger.error('Unexpected client error {}'.format(e.message))
 
-
     ##
     # CloudWatch Logging
     ##
@@ -1414,26 +1800,28 @@ class Zappa(object):
     def fetch_logs(self, lambda_name, filter_pattern='', limit=10000):
         """
         Fetch the CloudWatch logs for a given Lambda name.
-
         """
-
         log_name = '/aws/lambda/' + lambda_name
-        streams = self.logs_client.describe_log_streams(logGroupName=log_name,
-                                            descending=True,
-                                            orderBy='LastEventTime')
+        streams = self.logs_client.describe_log_streams(
+            logGroupName=log_name,
+            descending=True,
+            orderBy='LastEventTime'
+        )
 
         all_streams = streams['logStreams']
         all_names = [stream['logStreamName'] for stream in all_streams]
-        response = self.logs_client.filter_log_events(logGroupName=log_name,
-                            logStreamNames=all_names,
-                            filterPattern=filter_pattern,
-                            limit=limit)
+        response = self.logs_client.filter_log_events(
+            logGroupName=log_name,
+            logStreamNames=all_names,
+            filterPattern=filter_pattern,
+            limit=limit
+        )
 
         return response['events']
 
     def remove_log_group(self, group_name):
         """
-        Filters all log groups that match the name given in log_filter.
+        Filter all log groups that match the name given in log_filter.
         """
         print("Removing log group: {}".format(group_name))
         try:
@@ -1443,7 +1831,7 @@ class Zappa(object):
 
     def remove_lambda_function_logs(self, lambda_function_name):
         """
-        Removes all logs that are assigned to a given lambda function id.
+        Remove all logs that are assigned to a given lambda function id.
         """
         self.remove_log_group('/aws/lambda/{}'.format(lambda_function_name))
 
@@ -1465,12 +1853,16 @@ class Zappa(object):
 
         """
         all_zones = self.route53.list_hosted_zones()
-        return self._get_best_match_zone(all_zones, domain)
+        return self.get_best_match_zone(all_zones, domain)
 
     @staticmethod
-    def _get_best_match_zone(all_zones, domain):
-        """Returns zone id which name is closer matched with domain name."""
-        zones = {zone['Name'][:-1]: zone['Id'] for zone in all_zones['HostedZones'] if zone['Name'][:-1] in domain}
+    def get_best_match_zone(all_zones, domain):
+        """Return zone id which name is closer matched with domain name."""
+
+        # Related: https://github.com/Miserlou/Zappa/issues/459
+        public_zones = [zone for zone in all_zones['HostedZones'] if not zone['Config']['PrivateZone']]
+
+        zones = {zone['Name'][:-1]: zone['Id'] for zone in public_zones if zone['Name'][:-1] in domain}
         if zones:
             keys = max(zones.keys(), key=lambda a: len(a))  # get longest key -- best match.
             return zones[keys]
@@ -1481,26 +1873,50 @@ class Zappa(object):
         """
         Set DNS challenge TXT.
         """
-
         print("Setting DNS challenge..")
         resp = self.route53.change_resource_record_sets(
             HostedZoneId=zone_id,
-            ChangeBatch={
-                'Changes': [{
-                    'Action': 'UPSERT',
-                    'ResourceRecordSet': {
-                        'Name': '_acme-challenge.{0}'.format(domain),
-                        'Type': 'TXT',
-                        'TTL': 60,
-                        'ResourceRecords': [{
-                            'Value': '"{0}"'.format(txt_challenge)
-                        }]
-                    }
-                }]
-            }
+            ChangeBatch=self.get_dns_challenge_change_batch('UPSERT', domain, txt_challenge)
         )
 
         return resp
+
+    def remove_dns_challenge_txt(self, zone_id, domain, txt_challenge):
+        """
+        Remove DNS challenge TXT.
+        """
+        print("Deleting DNS challenge..")
+        resp = self.route53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch=self.get_dns_challenge_change_batch('DELETE', domain, txt_challenge)
+        )
+
+        return resp
+
+    @staticmethod
+    def get_dns_challenge_change_batch(action, domain, txt_challenge):
+        """
+        Given action, domain and challege, return a change batch to use with
+        route53 call.
+
+        :param action: DELETE | UPSERT
+        :param domain: domain name
+        :param txt_challenge: challenge
+        :return: change set for a given action, domain and TXT challenge.
+        """
+        return {
+            'Changes': [{
+                'Action': action,
+                'ResourceRecordSet': {
+                    'Name': '_acme-challenge.{0}'.format(domain),
+                    'Type': 'TXT',
+                    'TTL': 60,
+                    'ResourceRecords': [{
+                        'Value': '"{0}"'.format(txt_challenge)
+                    }]
+                }
+            }]
+        }
 
     ##
     # Utility
@@ -1515,14 +1931,8 @@ class Zappa(object):
         An optional profile_name can be provided for config files that have multiple sets
         of credentials.
         """
-
         # Automatically load credentials from config or environment
         if not boto_session:
-
-            # Set aws_region to None to use the system's region instead
-            if self.aws_region is None:
-                self.aws_region = boto3.Session().region_name
-                logger.debug("Set region from boto: %s", self.aws_region)
 
             # If provided, use the supplied profile name.
             if profile_name:
@@ -1550,13 +1960,11 @@ class Zappa(object):
         if self.boto_session.region_name not in API_GATEWAY_REGIONS:
             print("Warning! AWS API Gateway may not be available in this AWS Region!")
 
-
     @staticmethod
     def selection_pattern(status_code):
         """
         Generate a regex to match a given status code in a response.
         """
-
         pattern = ''
 
         if status_code in ['301', '302']:
@@ -1573,3 +1981,7 @@ class Zappa(object):
                 return "{0:3.1f}{1!s}{2!s}".format(num, unit, suffix)
             num /= 1024.0
         return "{0:.1f}{1!s}{2!s}".format(num, 'Yi', suffix)
+
+    @staticmethod
+    def service_from_arn(arn):
+        return arn.split(':')[2]
