@@ -541,7 +541,7 @@ class Zappa(object):
 
         elif archive_format == 'tarball':
             print("Packaging project as gzipped tarball.")
-            archivef = tarfile.TarFile(archive_path, 'w:gz')
+            archivef = tarfile.open(archive_path, 'w:gz')
 
         for root, dirs, files in os.walk(temp_project_path):
 
